@@ -41,7 +41,7 @@ templates_dir = "templates"
 # only N copies, not one per bundle. Leave at 1 unless per-lane disk / sign-off
 # ergonomics actually bite (then prefer this over N separate workspaces).
 [driver]
-lanes = 1
+lanes = 3
 # Sign-off pass budget for one `nl-shell-pdca flow` run (issue #260): how many build-all → sign-off
 # passes a wave gets (and how many iterations a single issue gets) before the driver stops
 # driving it. A hard bundle can legitimately need many sign-off iterations; when the budget
@@ -96,7 +96,7 @@ worktree = true
 # unless you actually run out-of-band gate/verify reads against in-flight lanes (the common
 # serial / one-bundle-per-lane flow never contends, so 0 costs nothing). Each overflow is a
 # full checkout — size the cap to your disk headroom; spillover is logged when it happens.
-overflow = 0
+overflow = 1
 # Per-lane resource preflight (issue #213). A `lanes > 1` batch pins each bundle to a lane
 # slot and exports `$PDCA_LANE`; the instance's gate commands map that to a per-lane resource
 # (a worktree, a container, a port). This verifies those resources exist ONCE, before the
