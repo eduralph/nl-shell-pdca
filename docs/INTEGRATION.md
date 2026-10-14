@@ -190,6 +190,7 @@ List every project-specific script the cycle invokes (role → path + invocation
 | Target dependency bootstrap | `engine/scripts/install-target-deps.sh` (`[install].extra_bootstrap`) | `make install` | [built] |
 | CLI resolver for gate rows | `scripts/pdca` | `./scripts/pdca <subcommand>` | [built] |
 | Security-review advisory leaf | `agents/security-review.md` (+ `.claude/agents/`) | (model leaf, Check) | [built] |
+| Threat-model touch check (T2, advisory) | `engine/scripts/check-threat-model-touch.sh` (tests: `engine/tests/test_threat_model_touch.py`) | `nl-shell-pdca gates <id>` | [built] |
 | Driver | `src/pdca_harness/` | `nl-shell-pdca run <id>` | [built — stub leaves until #5] |
 | Act tooling (L4) | `src/pdca_harness/act.py` | `nl-shell-pdca act index`, `nl-shell-pdca act log --date <d>` | [built] |
 | Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `nl-shell-pdca gates [<id>] [--working-tree]` | [built — C4/T3/T4 wired] |
@@ -224,8 +225,35 @@ If the host already provides one of these, omit the shipped equivalent at render
 standalone project.
 
 ## 11. Per-repo P-/D-/C-/A- extensions
-None today. Add repo-prefixed rules (e.g. `nl-shell-pdca-C7`) that *tighten
-or add to* a generic rule — never weaken one — as running cycles surface them.
+Repo-prefixed rules that *tighten or add to* a generic rule, never weaken one.
+
+### nl-shell-pdca-C7 — VM- or hardware-validated slice
+
+Much of nl-shell's work can't produce a C4 red→green on the developer's machine: real
+sudo-rs (only in the throwaway VM), VM scripts (M1), the data pipeline with the teacher
+and sandbox (M2), GPU training and inference (M3–M5). Such tests carry nl-shell's pytest
+markers (`sudo`, `vm`, `gpu`, `teacher`) and are skipped outside their environment
+(nl-shell #73), so C4 reports `PDCA-UNVERIFIABLE`.
+
+For those slices:
+1. **Plan:** the brief's `External dependencies` field declares the environment as
+   `reference-vm` or `gpu-16gb` (with `no-check: …` if the doctor can't detect it), and
+   names the marked tests.
+2. **Do:** the builder writes and runs the tests that *can* run (pure logic, fakes such as
+   nl-shell's fake `sudo`). It never sets `NL_SHELL_TEST_VM=1` on the host.
+3. **Check:** T3 and T4 still gate. C4 may be `PDCA-UNVERIFIABLE` only if the bundle
+   holds a **`manual-validation.md`**: the commands run in the declared environment, their
+   output, and the marked tests' results there, with a date. Without it, the C4 item stays
+   open in §6 and sign-off can't accept.
+4. The doctor's WARN rows "reference VM" and "GPU" show whether the environment exists on
+   this host.
+
+### nl-shell-pdca-T2a — security-relevant changes update the threat model
+
+`engine/scripts/check-threat-model-touch.sh` (advisory): a patch touching nl-shell's gate,
+policy, PTY, session, sudo, passthrough, taint, reader, history, logging, backend or
+installer code, or the policy-gate, PTY, reader or proposal specs, without touching
+`.oss-scanner/threat_model.md` lands in §6 for a human decision.
 
 ## Answering an interactive leaf from another device
 
