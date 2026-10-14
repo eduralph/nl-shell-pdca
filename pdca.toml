@@ -356,7 +356,9 @@ size_guard = "off"
 # Python one); it survives `copier update` (config, not a template file). Empty ⇒ nothing.
 # For multiple concerns, drop composable scripts into scripts/bootstrap-tools.d/*.sh instead.
 [install]
-extra_bootstrap = ""
+# nl-shell's runtime + dev dependencies (pytest), never nl-shell itself — an installed copy
+# could shadow the worktree under test. Re-reads ../nl-shell/pyproject.toml each install.
+extra_bootstrap = "./engine/scripts/install-target-deps.sh"
 
 # Manual-test launch (`nl-shell-pdca try <id>`). Check's validation act and the visual / GUI /
 # manual-repro §6 NEEDS-HUMAN rows are a human call — for a GUI app that means running the
@@ -374,7 +376,9 @@ extra_bootstrap = ""
 # like a gate command; "" ⇒ `nl-shell-pdca try` errors with a configure-me hint.
 [manual_test]
 # cmd = "python -m gramps"   # e.g. launch the app; a "./scripts/run-app.sh" wrapper also works
-cmd = ""
+# The patched REPL from the worktree's src/, on the instance venv (nl-shell's deps live
+# there). cwd is $PDCA_WORKTREE, so the venv is reached through $PDCA_BUNDLE.
+cmd = 'PYTHONPATH=src "$PDCA_BUNDLE/../../.venv/bin/python3" -m nl_shell'
 
 [tracker]
 system = "github"
@@ -927,6 +931,56 @@ argv = ["claude", "-p", "--agent", "security-review", "--permission-mode", "acce
 # per_lane = true
 # level = "WARN"
 
+# --- nl-shell-pdca's rows ------------------------------------------------------------
+[[doctor.checks]]
+group = "target"
+id = "sibling checkout ../nl-shell"
+cmd = "test -e ../nl-shell/.git"
+hint = "git clone https://github.com/eduralph/nl-shell.git ../nl-shell"
+required = true
+
+[[doctor.checks]]
+group = "target"
+id = "target test suite (C4/T3 gates)"
+cmd = "test -f ../nl-shell/pyproject.toml && test -d ../nl-shell/tests"
+hint = "the gates run nl-shell's pytest suite; it exists from nl-shell#9 (M0.1) on — then re-run make install"
+level = "WARN"
+
+[[doctor.checks]]
+group = "target"
+id = "threat model (security-review leaf)"
+cmd = "test -f ../nl-shell/.oss-scanner/threat_model.md"
+hint = "the security-review advisory leaf rates every patch against it; restore it in nl-shell"
+level = "WARN"
+
+[[doctor.checks]]
+group = "engine"
+id = "pytest importable (.venv)"
+cmd = ".venv/bin/python3 -c 'import pytest'"
+hint = "make install — [install].extra_bootstrap installs nl-shell's deps + pytest into .venv"
+required = true
+
+[[doctor.checks]]
+group = "engine"
+id = "nl-shell runtime deps (.venv)"
+cmd = ".venv/bin/python3 -c 'import prompt_toolkit'"
+hint = "make install — re-run it whenever nl-shell's pyproject.toml gains a dependency"
+level = "WARN"
+
+[[doctor.checks]]
+group = "engine"
+id = "pdca CLI resolvable (T4 row)"
+cmd = "./scripts/pdca --help"
+hint = "make install — or point $PDCA_CLI at the CLI; ./scripts/pdca resolves venv -> src -> PATH"
+required = true
+
+[[doctor.checks]]
+group = "engine"
+id = "bash >= 4 (C4 gate uses mapfile)"
+cmd = "bash -c 'test \"${BASH_VERSINFO[0]}\" -ge 4'"
+hint = "install a modern bash"
+level = "WARN"
+
 # Deterministic Check gates (docs 04). Each check runs a shell command; it PASSES
 # iff the command exits 0. `scope = "repo"` runs against the working tree (and is
 # what CI re-runs via `nl-shell-pdca gates --working-tree`); `scope = "bundle"` needs the
@@ -1078,7 +1132,14 @@ checks = [
   # already paid for it, and re-running a NONDETERMINISTIC reviewer after the human signed
   # off means a bundle green at Check can be refused at publish over a finding that did not
   # exist when §9 was recorded.
-  { id = "T4-contribution", tier = "T4", label = "PR body has a user-impact opener + tracker id in both artifacts", cmd = "nl-shell-pdca contribcheck", gating = true, scope = "bundle" },
+  # nl-shell's gates (engine/README.md). C4 proves THIS bundle's test red without the fix and
+  # green with it (pytest, judged by exit code AND tests actually run). T3 runs the whole
+  # suite and is GATING: nl-shell has been green since its first commit, so a red here came
+  # from this bundle. T4 goes through scripts/pdca so it resolves this checkout's CLI
+  # whether or not .venv/bin is on PATH (a bare console-script name is not).
+  { id = "C4-verify", tier = "C4", label = "fix verified: bundle test red pre-fix, green post-fix (pytest)", cmd = "./engine/scripts/run-verify.sh", gating = true, scope = "bundle" },
+  { id = "T3-suite", tier = "T3", label = "runtime: the whole nl-shell pytest suite on the patched worktree", cmd = "./engine/scripts/run-suite.sh", gating = true, scope = "bundle" },
+  { id = "T4-contribution", tier = "T4", label = "PR body has a user-impact opener + tracker id in both artifacts", cmd = "./scripts/pdca contribcheck", gating = true, scope = "bundle" },
 ]
 
 

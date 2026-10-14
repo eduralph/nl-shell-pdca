@@ -1,5 +1,22 @@
 # engine/ — the verification engine for nl-shell-pdca
 
+## This instance (nl-shell)
+
+| Gate | Script | Gating | What it proves |
+|---|---|---|---|
+| C4 | `scripts/run-verify.sh` | yes | The bundle's test is red with the production hunks reverted and green with them, judged by pytest's exit code **and** the tests that actually ran (`scripts/lib/junit_count.py`, from JUnit XML) |
+| T3 | `scripts/run-suite.sh` | yes | nl-shell's whole suite is green on the patched worktree (gating: green baseline since nl-shell#9) |
+| T4 | `../scripts/pdca contribcheck` | yes | Commit message and PR description shape |
+
+- `scripts/install-target-deps.sh` is `[install].extra_bootstrap`: it installs nl-shell's
+  dependencies into `.venv`, never nl-shell itself, so tests always import the worktree's
+  `src/` (nl-shell's pytest `pythonpath`).
+- Each pytest run gets a fresh, empty bytecode cache (`PYTHONPYCACHEPREFIX`). Python trusts
+  a cached `.pyc` whose source kept its size and mtime second, which a one-character revert
+  does — without this the red leg can run the green leg's code.
+- Engine tests: `.venv/bin/python3 -m unittest discover -s engine/tests` — one case per
+  row of the C4 truth table, against a throwaway pytest project.
+
 This directory holds the **project-specific verification engine**: the runners,
 helpers, and tooling the PDCA cycle invokes to *reproduce* a defect and *verify* a
 fix. It is the home that `pdca.toml` `[[gates.checks]]` `cmd`s and the
