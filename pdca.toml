@@ -563,11 +563,11 @@ argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits"
 # open: cleanup closes it as not planned.) A bundle already two splits deep (lineage depth
 # 2 or more) is not split again unless the human passes `--force` to `--accept`.
 [leaves.splitter]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "splitter"
-argv = ["claude", "--agent", "splitter", "--permission-mode", "acceptEdits"]
+argv = ["claude", "--remote-control", "--agent", "splitter", "--permission-mode", "acceptEdits"]
 
 [leaves.sizer]
 # Switch `mode` to "command" to enable — the argv below is ACTIVE so that one edit is
