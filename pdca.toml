@@ -494,7 +494,7 @@ base_remote = "origin"
 # Do builder — writes patch.diff + test + build-notes.md:
 
 [leaves.builder]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = false
 # Role prompt: canonical body agents/builder.md. Claude resolves it via the baked
@@ -591,7 +591,7 @@ argv = ["claude", "-p", "--agent", "sizer", "--allowedTools", "Read", "Write", "
 # argv = ["claude", "-p", "--agent", "sizer", "--allowedTools", "Read", "Write", "--model", "sonnet"]
 
 [leaves.reviewer]
-mode = "stub"
+mode = "command"
 family = "codex"
 interactive = false
 # Role prompt: canonical body agents/reviewer.md, inlined for codex / resolved via
@@ -643,21 +643,21 @@ argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"
 # generically to every backend. The headless builder/reviewer must NOT carry it: it starts
 # an *interactive* session and they have no human to reach.
 [leaves.planner]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "planner"
 argv = ["claude", "--agent", "planner", "--permission-mode", "acceptEdits"]
 
 [leaves.signoff]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "signoff"
 argv = ["claude", "--agent", "signoff", "--permission-mode", "acceptEdits"]
 
 [leaves.act]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "act"
@@ -667,7 +667,7 @@ argv = ["claude", "--agent", "act", "--permission-mode", "acceptEdits"]
 # git/draft-PR mechanics are deterministic code in pdca_harness.publish). A non-claude
 # publisher gets the driver's `gh` STOP-shim (guard.py) since it has no PreToolUse hook.
 [leaves.publisher]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "publisher"
@@ -747,12 +747,12 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # that touches no attacker-reachable input gets a one-line verdict, so the cost stays small.
 # Claude, like the builder: it stands apart by ROLE, as the adversary does.
 #
-# `stub` like every other leaf here today. Flip it to "command" with the rest when the
-# leaves go live — a stub writes a canned artifact and reviews nothing.
+# Live with the cycle leaves since nl-shell-pdca#5 (a stub writes a canned artifact and
+# reviews nothing, which looks like coverage and is worse than off).
 [[leaves.advisory]]
 id = "security-review"
 role = "security: what an attacker controlling the patch's inputs could do, rated against the target's threat model"
-mode = "stub"
+mode = "command"
 family = "claude"
 argv = ["claude", "-p", "--agent", "security-review", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 
