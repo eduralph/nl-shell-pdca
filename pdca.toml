@@ -730,7 +730,28 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # family = "claude"
 # argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 # when = { field = "difficulty", substring = "high" }
+
+# The SECURITY lens (after getwyrd/wyrd-pdca#274): reads the patch the way an attacker would —
+# who controls each input the diff touches, what they gain — and rates findings against
+# nl-shell's own threat model ($PDCA_TARGET/.oss-scanner/threat_model.md), not a generic
+# checklist. None of the other lenses asks that question, and nl-shell runs model-proposed
+# commands, passes sudo through, and feeds command output back to a model.
 #
+# ALWAYS ON (no `when`): the only selector is a brief field the planner writes, and a
+# self-reported field must not route a patch away from the review that would catch the
+# mis-rating (wyrd-pdca dropped the same gate from its adversary for that reason). A patch
+# that touches no attacker-reachable input gets a one-line verdict, so the cost stays small.
+# Claude, like the builder: it stands apart by ROLE, as the adversary does.
+#
+# `stub` like every other leaf here today. Flip it to "command" with the rest when the
+# leaves go live — a stub writes a canned artifact and reviews nothing.
+[[leaves.advisory]]
+id = "security-review"
+role = "security: what an attacker controlling the patch's inputs could do, rated against the target's threat model"
+mode = "stub"
+family = "claude"
+argv = ["claude", "-p", "--agent", "security-review", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
+
 # Advisory-selection policy (issue #64 default vs. issue #200). Unset ⇒ every advisory leaf
 # above whose `when` matches runs. Opt into `vendor-complement` to make cross-vendor
 # decorrelation (INTEGRATION §4) automatic: the driver treats the [[leaves.advisory]] list
