@@ -1,0 +1,1104 @@
+# pdca.toml — driver configuration for nl-shell-pdca.
+# Read by pdca_harness.config; the only project-specific runtime config.
+
+[project]
+name = "nl-shell-pdca"
+default_branch = "main"
+# Default §9 sign-off attribution, so `flow`/`signoff` never need a --by. Override
+# per-run with --by.
+author = "Eduard Ralph"
+
+# The target repo's standing review rubric (issue #314) — a path RELATIVE TO THE TARGET
+# CHECKOUT, optionally narrowed to one Markdown section. Unset (the default) leaves every
+# model prompt byte-identical to today.
+#
+# The asymmetry it removes: the builder generates without ever seeing the criteria the
+# reviewer applies, so a convention violation ships and returns as a finding — a
+# guaranteed review round for something the builder could have fixed before emitting. One
+# artifact reaches all three leaves (builder, reviewer, adversary), snapshotted per attempt
+# so they cannot be judged against different versions of it.
+#
+# rubric_file = "AGENTS.md"
+# rubric_section = "Review rubric & protocol"   # ATX headings only (`## Heading`);
+#                                               # matched exactly or as a prefix.
+
+[paths]
+bundle_root = "results"
+process_dir = "process"
+templates_dir = "templates"
+
+# In-driver lane concurrency (docs 09 §parallel lanes). `lanes` is the worker-pool
+# size for the UNATTENDED Do+Check band only — Plan, sign-off, publish, and Act stay
+# serial. 1 (the default) is the strictly-serial driver. Override for a single run
+# with `PDCA_LANES=N` or `--lanes N` on `nl-shell-pdca flow`.
+#
+# A pool > 1 runs N bundles concurrently in ONE workspace. Each worker is pinned to a
+# fixed lane slot 0..N-1 and exposes it to every gate command as `$PDCA_LANE`. A gate
+# that backs onto a shared mutable resource (a target checkout it applies/reverts, a
+# container, a port, a scratch dir) MUST name that resource by `$PDCA_LANE` so two
+# lanes can't collide — e.g. `--name app-l$PDCA_LANE`, a `repo-lane$PDCA_LANE`
+# checkout. Bundles in the same lane reuse that lane's resources serially, so you need
+# only N copies, not one per bundle. Leave at 1 unless per-lane disk / sign-off
+# ergonomics actually bite (then prefer this over N separate workspaces).
+[driver]
+lanes = 1
+# Sign-off pass budget for one `nl-shell-pdca flow` run (issue #260): how many build-all → sign-off
+# passes a wave gets (and how many iterations a single issue gets) before the driver stops
+# driving it. A hard bundle can legitimately need many sign-off iterations; when the budget
+# runs out with one still iterating, the run does NOT abandon it silently — it is named on
+# stderr with a `nl-shell-pdca flow <id>` resume hint, and its accepted siblings still publish. Raise
+# this rather than editing source. `PDCA_MAX_PASSES` overrides for one run; `--max-passes`
+# overrides both.
+max_passes = 20
+# Auto-iterate while Check still finds implementation work (issues #264, #409). A big Do
+# typically lands with implementation defects the reviewer or the adversary catches — a logic
+# slip, a weak test, a red gate. Each of those parks the bundle at AWAITING_SIGNOFF and asks
+# you to press "iterate-do", which is the decision the driver could have made itself. With
+# this on, while the reviewer keeps finding implementation defects the driver records
+# `iterate-do` and rebuilds, unattended — so Do→Check iterates while there is work only Do can
+# do, and hands over once it is gone.
+#
+# Your judgment is still required for anything architectural: a REAL concern on a judgment
+# cell (C5 causal adequacy, T5 judgment), an external dependency, an unmarked advisory
+# finding, or a §6 item it cannot classify. Beside an implementation defect those no longer
+# halt the bundle — they are DEFERRED: held in the bundle's `deferred-findings.json` and put
+# back into §6 at handover, where you must clear each one before accepting. With no
+# implementation defect beside them, the bundle halts at once. A review or gate that gave no
+# verdict (a gate that could not run, a review that came back empty) is not held: the next
+# Check runs it again, so §6 shows it only while it still fails. The reviewer's
+# `Validation — fitness-to-purpose` row is emitted NEEDS-HUMAN on EVERY cycle by design, so
+# it is a constant, never deferred — but still in §6 for you to clear (#293).
+#
+# It NEVER auto-accepts and never ticks a §6 box. Two things stop the loop: the size backstop
+# (the empirical size thresholds further down, whose `rounds` rule fires before this cap on
+# purpose) and `max_auto_iters` rounds per bundle (clamped below max_passes). On either the
+# bundle halts for you as before. `PDCA_AUTO_ITERATE=1` / `--auto-iterate` override.
+auto_iterate = false
+max_auto_iters = 3
+# Worktree isolation (issue #94). A cycle's Do/Check run in a dedicated git worktree off
+# the target's base, so the host's primary checkout is NEVER mutated in place. The harness
+# creates/resets it per cycle (per lane slot) and exposes its path as `$PDCA_WORKTREE` —
+# the builder edits there (granted access automatically), and gate commands should target
+# `$PDCA_WORKTREE` too (see the gate examples below). On by default; best-effort (a target
+# that isn't a worktree-capable git checkout falls back to in-place). Set false to disable.
+worktree = true
+# Overflow worktrees (issue #226). The cap on concurrent EPHEMERAL "overflow" worktrees;
+# 0 (default) disables. This reframes `lanes` above as a warm CACHED pool (reset-and-reused,
+# build cache kept warm on the hot Do→Check path) and handles the EXCEPTIONAL read — a gate
+# / re-gate for a bundle whose cached lane is currently owned by a DIFFERENT bundle (an
+# out-of-cadence or contended read) — by spinning up a throwaway worktree off the base +
+# that bundle's patch, running there, and removing it, instead of mutating a lane another
+# bundle may still want. It's correct by construction (a fresh tree can't carry a foreign
+# orphan, the #224 class of bug). Note every gating read now reconstructs base + patch.diff
+# in the lane anyway (#296 — the lane is a warm checkout cache, not a trusted content
+# cache); overflow's job is purely to avoid clobbering a lane another bundle still owns.
+# At the cap it falls back to reconstructing in the lane in place. Leave at 0
+# unless you actually run out-of-band gate/verify reads against in-flight lanes (the common
+# serial / one-bundle-per-lane flow never contends, so 0 costs nothing). Each overflow is a
+# full checkout — size the cap to your disk headroom; spillover is logged when it happens.
+overflow = 0
+# Per-lane resource preflight (issue #213). A `lanes > 1` batch pins each bundle to a lane
+# slot and exports `$PDCA_LANE`; the instance's gate commands map that to a per-lane resource
+# (a worktree, a container, a port). This verifies those resources exist ONCE, before the
+# fan-out, and aborts the run (before any lane spawns) if they don't — so a batch never runs
+# against missing lanes and produces a pile of false-red bundles. Two ways, either or both:
+#   * the REQUIRED `per_lane` [[doctor.checks]] are run automatically (no new config);
+#   * `lane_preflight` is a generic command run once ({lanes} interpolated) — the escape hatch
+#     for a resource not expressed as a doctor row; a non-zero exit aborts. Serial (lanes<=1)
+#     runs never preflight; empty ⇒ only the doctor rows (or nothing). It only VERIFIES —
+#     provisioning stays the instance's job (e.g. `make worktrees LANES={lanes}`).
+# lane_preflight = "test -e ../repo-lane{lanes}/.git || { echo 'run: make worktrees LANES={lanes}'; exit 1; }"
+# Wave-based batch sequencing (#wave-model). When `nl-shell-pdca flow` is given several ids it runs
+# them as an ordered sequence of dependency waves (computed from each brief's `Depends on`
+# / `Conflicts with`): a wave's bundles build in parallel, then its accepted work reaches
+# the NEXT wave's base one of two ways.
+#   wave_mode = "stack"  (default) — merge each wave's accepted, published PR branches onto a
+#       run-scoped integration branch the next wave builds on; every PR targets the real
+#       base. This is PUSH-ONLY (a fork has push), keeps the STOP discipline (the harness
+#       never merges into your target; you merge the PR stack bottom-up with a merge commit,
+#       not squash or rebase), and completes a dependent batch in one run. Each batch gets
+#       its own line, pdca-integration/<base>-r<key> (the key comes from the ids the run
+#       was asked to drive), so two runs on one base never share one. Within a run the
+#       line only grows: the first fold force-pushes it fresh off the base (if origin refuses
+#       force-pushes, delete the old pdca-integration/<base>-r<key> or allow force-pushes
+#       on pdca-integration/*), later folds push without force. A bundle whose publish pushed
+#       no branch holds only its dependents. The fork-safe default.
+#   wave_mode = "merge"  (own-repo / continuous-delivery ONLY) — `gh pr merge` each
+#       non-final wave's PRs so the next wave builds on the genuinely-merged base. Needs
+#       MERGE RIGHTS on the base remote (a fork contributor lacks them upstream — keep
+#       "stack" there) and relaxes the STOP discipline for the batch. Fail-closed: a
+#       non-mergeable PR stops the run.
+#       A wave's PRs merge one after another, so under merge_requires = "all" a PR found
+#       BEHIND its base (an earlier PR of the wave just merged) is first brought up to date
+#       and its new head verified again before it merges — see merge_requires. Turn on
+#       "require branches to be up to date" (`strict`) in the base's branch protection for
+#       merge mode: the host then also refuses a merge if the base moves after the driver's
+#       last read, a window no client-side check can close.
+wave_mode = "stack"
+# The `gh pr merge` strategy when wave_mode = "merge": "merge" (a merge commit — auditable,
+# bisectable; the default), "squash", or "rebase". It governs only that final merge: the
+# update of a PR that is behind its base (merge_requires) is always a merge commit.
+merge_method = "merge"
+# Which checks must be green before wave_mode = "merge" merges a non-final wave's PR
+# (issue #413). `gh pr merge` alone fails closed ONLY on the checks this host marks
+# *required* in branch protection — so on a thinly-protected repo a red non-required job,
+# or a run still in flight, merges anyway and the next wave builds on a base that never
+# went green.
+#   merge_requires = "all"       (default) — read the PR's FULL check rollup here, with
+#       `gh pr checks`, AFTER the ready-mark (which can itself trigger `ready_for_review`
+#       CI) and immediately before the merge; refuse — no merge, the run STOPs — on any
+#       failing check, any pending/queued one, and on an EMPTY rollup (no checks reported
+#       at all: absence of evidence is not green). Skipped/neutral checks are completed
+#       non-failures and do not block. Refusing is cheap: re-run once CI is green and the
+#       wave resumes idempotently.
+#       A rollup only describes the head it ran on, built on the base that head contains
+#       (issue #531), so first the driver reads whether the PR's head is BEHIND its base, in
+#       plain git: the head from `gh pr view`, a fetch, and `git merge-base --is-ancestor
+#       <base tip> <head>` in the publish checkout. If it is behind, the driver updates the
+#       PR's own branch with a merge commit of the base (`gh pr update-branch`, never a
+#       rebase of the reviewed commits), waits for that update to land, and reads the
+#       rollup of the NEW head. After the green it reads the head and base again (the head
+#       must be unchanged and still up to date) and merges pinned to that head (`gh pr
+#       merge --match-head-commit`). An update that fails (a conflict with the base) or
+#       does not land in time, an updated head that is not green, a head that changed, a
+#       base that moved, or git failing refuses and stops the run, the PR back in draft;
+#       an update commit already pushed stays on the PR branch.
+#   merge_requires = "required"  — host-config-only semantics: skip that gate, so branch
+#       protection is again the only backstop (and an empty rollup merges). Correct only
+#       where the host's required checks really are the whole verification. It also skips
+#       the behind read and the update, so it keeps the stale-base behaviour: with `strict`
+#       off, a PR green only against the base as it was before an earlier PR of its wave
+#       merged can merge unverified; with `strict` on, the wave's second merge is refused
+#       and the run stops after the first. Use "all" for merge mode.
+merge_requires = "all"
+# Bounded wait for that same non-final check-rollup gate (issue #462). A wave boundary
+# fires SECONDS after the PR is opened, so the FIRST rollup read is routinely `pending`
+# (queued/running) or `empty` (nothing reported yet) — that is absence of evidence, not a
+# verdict. `_merge_one` re-reads the rollup until it clears pending/empty or this many
+# wall-clock seconds elapse; only then does an unresolved rollup refuse (with a message
+# that says the checks never reported in time, distinct from a check that actually failed).
+# A green read is confirmed by one more read a full poll interval (15 s) later, charged to
+# this budget: an early rollup can be green on the fast checks alone, before a slow job has
+# registered (issue #582). A green first seen with less than 15 s of budget left to confirm
+# it refuses as not finished (so a value from 1 to 14 refuses every PR) — raise this bound
+# if your checks are slow to report.
+# The same budget covers waiting for `gh pr update-branch` to land on a PR that was behind
+# its base (issue #531; the head is re-read every 5 s): that time is charged to it, and the
+# rollup wait for the updated head gets what is left.
+# On every refusal after the ready-mark — timeout, a red/unreadable rollup, a failed update
+# or base read, or a failing `gh pr merge` — the PR is returned to draft (`gh pr ready
+# --undo`) before the run STOPs, so a stopped wave never leaves a PR advertising a readiness
+# no human granted.
+#   300  (default) — a sensible bound for CI to register and report on a freshly-opened PR.
+#   0    — perform no wait at all: a single read, the original immediate-refusal behaviour.
+merge_wait_secs = 300
+# Optional integration re-gate (#wave-model). After each wave folds (stack mode), run the
+# repo-scoped gates over the folded integration tip before the next wave builds on it, so a
+# combination that is red though each fix was green ALONE stops the run. Off by default
+# (needs your repo-scoped gates). It has NO effect in merge mode (it applies to the stack
+# fold only): there the check at the merge boundary is each PR's own CI, which
+# merge_requires = "all" reads on a head brought up to date with its base.
+regate_between_waves = false
+# Act cadence (issue #109). Act is a cross-cycle beat that yields a real delta only once
+# enough cycles have frozen to show a pattern, so `nl-shell-pdca flow` auto-runs it only when this
+# many cycles have frozen SINCE the last Act review — counted across flow invocations
+# (five one-bundle flows trip it on the fifth), not per-run. Below the threshold the flow
+# skips Act with a hint; `nl-shell-pdca act log` runs it on demand and `--no-act` always skips.
+# Set to 1 to run Act after every completed flow (the prior behaviour).
+act_cadence = 5
+# Footprint sweep (issue #297). What `nl-shell-pdca flow` does with the harness's sibling
+# worktrees once a run's waves complete (the publish/freeze boundary). Left unbounded,
+# stale lane/integration/overflow trees and their build dirs (target/, node_modules, …)
+# have accumulated >200 GB and false-redded GATING gates with 'Disk quota exceeded'
+# mid-`cargo test` — an environment fault misattributed to the patch.
+#   "clean"  (default) — strip lane worktrees of build state (`git clean -fdxq` +
+#            `reset --hard`; the bulk of the footprint) but keep the checkouts warm;
+#            remove integration + overflow trees outright (each fold resets its tree to a
+#            freshly fetched ref — the base, or the run's pushed tip — so their reuse value
+#            is nil).
+#   "remove" — remove lane worktrees too (Do / `nl-shell-pdca try` recreate them on demand).
+#   "off"    — never sweep automatically; `nl-shell-pdca sweep` still reclaims on demand.
+sweep_worktrees = "clean"
+# Close-disposition fast path (issue #60). A bundle whose brief's `Disposition hint`
+# matches one of these close / no-fix classes skips the builder + reviewer model leaves
+# (the engine's only token spend) and routes straight to sign-off, where the human
+# confirms or overrides the close. It is a HINT, not a gate: reopening to a fix path
+# (iterate-to-Do) re-enables the full Do+Check band. Substring-matched, case-insensitive,
+# against the disposition value. Retune this list to your tracker's vocabulary; omit it
+# to use the built-in default shown here.
+# close_dispositions = ["likely-close", "wontfix", "by-design", "duplicate", "not-reproducible", "manual-verification", "upstream", "external"]
+# Pre-dispatch size advisory (#321): "off" (default) | "warn". With "warn" the driver
+# prints an oversize note before Do, naming which signal fired, and proceeds. There is
+# deliberately NO blocking mode: calibrated over 86 real bundles the structural signal
+# peaks at 62% precision — nearly one wrong hold per right one — and a gate at that rate is
+# one people learn to override.
+#
+# Placed at the END of [driver] but INSIDE it — a key after the next `[table]` header
+# belongs to that table, so this sat in `publisher.checkouts` and `driver.size_guard`
+# was absent: setting it to "warn" did nothing at all. Not beside `lanes` either, `copier update` merges
+# three ways, so a NEW line adjacent to a line instances commonly edit (and `lanes` is the
+# most edited in this table) lands as a git conflict marker in pdca.toml — after which
+# every `pdca` command dies at config load. Add new keys here, away from the contested ones.
+size_guard = "off"
+# Do-exit halt on a BUILDER-declared unmet external dependency (#341) — opt-in, default
+# off (byte-identical while off). The builder contract makes an honest builder declare a
+# dependency it could not build/verify against (`NEEDS-HUMAN external dependency: …` in
+# build-notes.md, plus a proposed [[doctor.checks]] row in a fenced ```toml block). With
+# this on, the driver ADJUDICATES that claim deterministically at BUILT: the named
+# dependency must resolve to a [[doctor.checks]] row (registered here, else the builder's
+# proposed row) AND that row's detect cmd must exit non-zero. Confirmed ⇒ the bundle takes
+# the close fast path to sign-off (N/A gates, no reviewer/adversary spent on a patch
+# already stated to be unverifiable) and stays RESUMABLE — install the dependency and
+# answer iterate-do; sign-off still owns every terminal state. Refuted (the cmd exits 0)
+# or unresolvable/malformed ⇒ full Check runs unchanged, with the refutation recorded
+# into §6 — a self-report can never skip review on its own say-so. STRICT boolean:
+# write `dependency_halt = true` unquoted, or it stays off.
+# dependency_halt = true
+# Per-leaf memory bound (issue #420) — opt-in, unset by default. Every leaf subprocess the
+# driver spawns (planner, builder, reviewer, advisory, sign-off, publisher, Act — headless
+# and interactive alike) runs inside its own transient systemd scope capped at this value,
+# so a leaf that overruns is killed AS ITSELF: it exits non-zero, the bundle records that
+# leaf's failure, and the run survives to report it. Unbounded, it doesn't work that way —
+# two concurrent reviewer leaves building cold trees pushed the session past the oomd
+# pressure threshold and systemd-oomd killed the whole terminal CGROUP: driver, every lane,
+# every bundle, with nothing in any gate log to say why (oomd kills the cgroup, not the
+# offending process, so the driver just vanishes).
+#   * a systemd byte value — "8G", "12G" — or a percentage of RAM ("50%");
+#   * unset (the default) ⇒ NO wrapping and byte-identical argv, i.e. exactly today's
+#     spawn. There is no portable number to default to, and a cap set too low is itself a
+#     way to kill a run — size it against your leaves' real peak, not optimistically;
+#   * a host with no usable `systemd-run --user --scope` (no systemd, no user manager, a
+#     container, macOS) degrades to that same no-op with one note on stderr — never a hard
+#     failure, and never a silent one;
+#   * per-leaf override: `memory_max` under any [leaves.*] table (below) wins for that leaf;
+#     `memory_max = "off"` there opts one leaf out of the driver-level bound entirely.
+#
+# A bound in force also turns on memory telemetry for the headless leaves (no extra knob):
+# on every heartbeat tick the driver samples the leaf's scope — memory used, process
+# count, top command lines by RSS — into a bundle-local `*.memory.jsonl` (the builder's is
+# `build.memory.jsonl`), the tick line grows a `mem 1.2GB/8G · 34 procs` suffix, and a leaf
+# that dies gets a post-mortem (last sample + the scope's journal excerpt) appended to its
+# `*.error.log`. So an OOM kill names WHAT filled the scope — e.g. `1187× python3 -m
+# unittest …` — not just that it died.
+# leaf_memory_max = "8G"
+
+
+# A-priori size-estimate weights + cutoffs (issues #320/#359). [driver.sizing] tunes the
+# structural estimator that scores each brief BEFORE Do runs; the shipped defaults are
+# calibrated against 86 settled bundles of a real instance, so this block is commented out
+# — uncomment only the keys you retune, anything omitted keeps the shipped default. A
+# sub-table: it must sit after every bare [driver] key (see the note above size_guard).
+#
+# RETUNING (#359) — walking a fresh `size-calibrate` run back into this table. The numbers
+# only stay honest against YOUR corpus, and drift is visible in the Act index's per-cycle
+# `sizing:` line (a-priori estimate vs measured outcome). At Act cadence:
+#   1. Mine the instance:  PYTHONPATH=src scripts/size-calibrate   (add `--csv out.csv`
+#      for the per-bundle table a threshold is actually argued from).
+#   2. "Rank correlation … vs rounds": set each feature weight proportional to |rho|
+#      against ROUNDS — churn is what the score predicts. A feature indistinguishable
+#      from noise keeps weight 0; weighting it would be fitting noise.
+#   3. "Median feature value, converged vs churned": put `brief_bytes_kb` at the knee
+#      between the two medians (shipped: 12).
+#   4. Set `watch` where the churn rate first clears your corpus base rate, `oversized`
+#      where precision peaks (shipped: 4 / 7 at a 19% base rate).
+#
+# `model_weight` (#359): how much a sizer-leaf escalation (a watch/oversized verdict from
+# [leaves.sizer]) adds to the numeric score. 0 — the default — is today's behaviour: the
+# model raises the BAND only, escalate-only, and the score stays purely structural. It is
+# config rather than a constant precisely so the Act-cadence review above can move it —
+# but know the loop's blind spot before you do: the Act index's `sizing:` line carries
+# the STRUCTURAL estimate only (the stored sizer verdict is not joined in), and
+# size-calibrate mines no model-verdict feature, so escalation-vs-outcome correlation is
+# not observable from either artifact yet. Until one of them grows that column — or you
+# mine the bundles' sizing.json by hand — a retuning pass has no evidence that can
+# justify moving model_weight off 0: leave it at 0 and record the gap in the Act notes
+# rather than tuning it on taste.
+# [driver.sizing]
+# conflicts_with = 3
+# difficulty_high = 3
+# ext_deps = 3
+# brief_bytes = 3
+# is_plan_pointer = -2
+# brief_bytes_kb = 12
+# watch = 4
+# oversized = 7
+# model_weight = 0
+
+
+# Empirical size backstop thresholds (issue #324). Measured at Check from the patch that
+# actually arrived, unlike [driver.sizing] which guesses from the brief before a line is
+# written — and much better at it: against "did this bundle churn >=3 rounds" over the same
+# 86 settled bundles, patch >=100 KB scores 71% precision and >=20 files 86%, where the
+# a-priori score peaks at 62%. Crossing a threshold raises a §6 NEEDS-HUMAN item (which
+# stops auto-iterate) recommending `iterate-plan`; it never blocks — at 70% precision
+# for the union, roughly three firings in ten are a coherent large change.
+#
+# `rounds` fires at 2 while max_auto_iters above defaults to 3, so it deliberately stops the
+# rebuild loop with a round still nominally available: the budget is a CEILING on how many
+# rebuilds are worth attempting, and this is evidence that more rebuilds are the wrong move
+# (76% of bundles at two rounds reach a third). The flow names this rule on stderr when it
+# declines, so an early halt is never a mystery. Set any threshold to 0 to switch it off.
+#
+# Commented out because the defaults ARE the calibrated values; uncomment to retune against
+# your own corpus with `scripts/size-calibrate`. A sub-table, so it must sit after every bare
+# [driver] key — see the note above size_guard for what happens when that ordering slips.
+# [driver.size_signal]
+# patch_kb = 100
+# patch_files = 20
+# rounds = 2
+
+
+# Install bootstrap (issue #207). `make install` runs scripts/bootstrap-tools.sh, which
+# provisions the harness-universal tools (git, gh, a pip-capable venv) and the leaf backends
+# your [leaves.*].family use. It hardcodes NO project gate toolchain — that is instance-owned.
+# `extra_bootstrap` is one idempotent command the bootstrap runs LAST to provision THIS
+# project's gate toolchain (e.g. rustup for a cargo-xtask gate, or `pip install .[test]` for a
+# Python one); it survives `copier update` (config, not a template file). Empty ⇒ nothing.
+# For multiple concerns, drop composable scripts into scripts/bootstrap-tools.d/*.sh instead.
+[install]
+extra_bootstrap = ""
+
+# Manual-test launch (`nl-shell-pdca try <id>`). Check's validation act and the visual / GUI /
+# manual-repro §6 NEEDS-HUMAN rows are a human call — for a GUI app that means running the
+# PATCHED build by hand. The deterministic gates can't, and the reviewer leaf is headless +
+# sandboxed, so `nl-shell-pdca try <id>` is the on-demand human path: it MATERIALIZES the patched
+# tree from the bundle's patch.diff (reconstructed off the base — needs [driver].worktree on)
+# and launches this command from it, inheriting your terminal with NO timeout (quit to return).
+# Because it rebuilds from patch.diff, it works for ANY parked bundle in a batch, not only the
+# last one Do built. The command runs from cwd=$PDCA_WORKTREE with $PDCA_BUNDLE / $PDCA_WORKTREE
+# / $PDCA_TARGET (and $PDCA_LANE under concurrency) exported — same convention as a gate cmd;
+# reference a repo script by an ABSOLUTE path (e.g. "$PDCA_BUNDLE/../../scripts/foo.sh"), not
+# a bare ./scripts/… (which would resolve against the worktree, not your project). It is
+# ADVISORY: it decides nothing (record what you saw in a Manual-verification note and sign
+# off in §9), and edits made while testing are reset on the next Do. Project-specific data,
+# like a gate command; "" ⇒ `nl-shell-pdca try` errors with a configure-me hint.
+[manual_test]
+# cmd = "python -m gramps"   # e.g. launch the app; a "./scripts/run-app.sh" wrapper also works
+cmd = ""
+
+[tracker]
+system = "github"
+url = "https://github.com/eduralph/nl-shell/issues"
+issue_id_example = "#123"
+# Trailer linking a commit/PR to the issue ({id} = the bug id). Trackers differ
+# (GitHub/Mantis "Fixes #{id}", Jira "Fixes PROJ-{id}"); "" enforces none. The
+# publish step's commit-msg ends with this; the T4 gate (if any) checks it.
+# No tracker id yet? Use `nl-shell-pdca publish --no-issue`: it omits the trailer, runs T4
+# in the narrow pending-id mode (only the tracker-id requirement is dropped — everything
+# else still blocks), and records the bundle `id_pending` (no magic "#0000" placeholder).
+issue_trailer = "Fixes #{id}"
+# Optional issue-URL template ({id} = the bug id). Set it and `nl-shell-pdca publish`
+# DETERMINISTICALLY hyperlinks the ticket id in the PR body (a Markdown link on the id, not
+# a bare number) — it does not depend on the model complying. E.g. Mantis
+# "https://github.com/eduralph/nl-shell/issues/view.php?id={id}", GitHub "https://github.com/eduralph/nl-shell/issues/{id}". "" ⇒ no link (bare id).
+issue_url_pattern = ""
+# Optional default tracker export the Plan leaf reads the issue row from when `flow`
+# runs without --from-csv (it reads ONLY that issue's row, not a repo scan):
+# export_csv = "path/to/export.csv"
+# Optional tracker-scrape command run before a Plan beat to seed a bundle's
+# issue_<id>/notes.json (the planner reads it for the full comment thread) — so a
+# seeded id list briefs end-to-end without scraping by hand (issue #65). It is a
+# `.format(id=)` shell template; $PDCA_BUNDLE is the bundle dir, and the command MUST
+# write notes.json there itself. Skipped when notes.json already exists; a failure is
+# non-fatal (Plan falls back to the CSV / asking the human). "" / unset → no fetch.
+# notes_cmd = "./engine/scripts/scrape-notes.sh {id}"
+
+# Composable Plan-seeding sources (issue #102) — a brief often draws on MORE than the
+# ticket (a linked proposal / ADR / spec, a CSV row). Declare one or more providers as
+# [[plan.source]]; each contributes context into the bundle's `sources/` dir before the
+# Plan beat, and the planner briefs from ALL of them. Each is best-effort (a missing tool
+# / file / failing command is non-fatal). Built-in types: github (gh), gitlab (glab), csv,
+# file (a path/glob, {id} interpolated), command (the escape hatch — a `.format(id=)` shell
+# command run with $PDCA_BUNDLE / $PDCA_SOURCES set; it writes its own output). The legacy
+# notes_cmd above still runs alongside these, so they are purely additive — EXCEPT a source
+# that sets `role = "tracker"` (issue #132): it IS the tracker thread, writes the canonical
+# notes.json itself, and SUPPRESSES notes_cmd, so the issue is sourced once rather than
+# fetched/stored twice. `notes_cmd` and a tracker-role plan.source are mutually exclusive.
+# Examples (uncomment to use):
+# [[plan.source]]
+# type = "github"            # gh issue view {id} --json … → sources/github-<id>.json
+# # role = "tracker"         # make THIS the tracker fetch (→ notes.json) and drop notes_cmd
+# # repo = "owner/repo"      # optional; omit to use gh's default repo
+# [[plan.source]]
+# type = "file"              # a linked design doc / ADR / proposal / spec
+# path = "docs/adr/*{id}*.md"
+# [[plan.source]]
+# type = "csv"
+# path = "path/to/export.csv"
+# key = "id"                 # the id column header; omit to copy the whole export
+# [[plan.source]]
+# type = "command"           # exactly today's notes_cmd, but one of several sources
+# cmd = "./engine/scripts/scrape-notes.sh {id}"
+
+# Publish mechanics — `nl-shell-pdca publish` and the flow's publish-on-accept (docs 03 §Check
+# closing step). Branch patterns are `{id}` / `{slug}` format strings; the
+# repo→checkout map falls back to the sibling convention (`<project>/../<repo-last-
+# segment>`) when a repo_spec is unmapped, so most setups need no entries.
+[publisher]
+fix_branch_pattern = "fix/{id}-{slug}"
+feature_branch_pattern = "enhancement/{id}-{slug}"
+# The remote the new-PR path branches the fix off of (issue #83). A fork branches off
+# `upstream` (canonical) and pushes to `origin` (the fork); an own-repo target has only
+# `origin`. Defaulted from contribution_model; change it if your remotes differ.
+base_remote = "origin"
+
+[publisher.checkouts]
+# "<org/repo>" = "../<checkout-dir>"   # only the exceptions to the sibling default
+
+# Result-bundle recording (issue #317) — `nl-shell-pdca record [<ids>…]` commits the
+# bundles whose cycle is OVER (state COMPLETE / DISCONTINUED / RESOLVED; never a bundle
+# in motion or one halted for a human) to THIS instance repo as one batch commit, so a
+# bundle's provenance stops living on one machine only. Publish also triggers it,
+# strictly after its publish.json write. Off by default — enable it only if this
+# instance versions its bundle_root (results/).
+# [records]
+# mode = "commit"            # off (default) | commit | pr
+# branch = "records/{date}"                                # pr mode: the pushed branch
+# subject = "chore(records): record {n} result bundle(s)"  # {n}, {ids}, {date}
+# issue = "ask"              # pr mode: the tracker issue the batch PR references —
+#                            # "ask" prompts when interactive (a headless run records
+#                            # the commit only, and says so), or a literal number
+
+# The six model leaves (docs 03 §Implementation substrate). mode = "stub" runs
+# the offline placeholders (no model/TTY) so the driver works without a model;
+# mode = "command" runs `argv` as a subprocess with the leaf's prompt. `interactive
+# = true` hands the terminal to the human (a seeded `claude "<prompt>"` REPL, no
+# -p); a headless leaf runs autonomously (`claude -p …`) and writes its artifact.
+# Set PDCA_LEAVES_MODE=stub to force stubs everywhere (CI / `make` determinism).
+#
+# Any leaf table below also takes `memory_max = "8G"` (issue #420) — this leaf's own
+# memory bound, overriding [driver].leaf_memory_max for it alone; `memory_max = "off"`
+# opts it out of a driver-level bound. Omit it (the default) to inherit that bound. A
+# reviewer that re-verifies red→green on a cold tree is the leaf that needs the most
+# headroom; an interactive REPL the human works in for an hour is the one most likely
+# to want "off". "Any" includes the ARRAY-form tables: [[leaves.advisory]] and
+# [[leaves.plan_advisory]] each take their own (that pool is what a run fans out
+# CONCURRENTLY, so it is the usual place to spend a smaller cap), while
+# [[leaves.builder_variant]] / [[leaves.builder_escalation]] / [[leaves.sizer_escalation]]
+# INHERIT the leaf they vary unless they set their own — a variant is the same appetite
+# as its base leaf, and must not silently lose its cap or its "off".
+#
+# Headless leaves ----------------------------------------------------------------
+# Do builder — writes patch.diff + test + build-notes.md:
+
+[leaves.builder]
+mode = "stub"
+family = "claude"
+interactive = false
+# Role prompt: canonical body agents/builder.md. Claude resolves it via the baked
+# `--agent builder`; codex (no agent flag) has it inlined into the prompt.
+agent = "builder"
+argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+
+# Builder escalation ladder (issue #135) — optional. A bundle that fails Check and
+# iterates re-runs the builder; without escalation it re-fails with the same model until
+# you discontinue. Declare stronger backends keyed on the attempt number; do_build picks
+# the entry with the highest `min_iteration` <= the current attempt (so a hard bundle
+# can't loop forever on an underpowered executor). Each entry inherits any field it omits
+# from [leaves.builder]. Iterations-to-pass + which backend ran each pass (family plus the
+# effective model/effort, so a ladder INSIDE one vendor stays readable) land in the
+# bundle's loop-telemetry.json — the go/no-go metric for adopting a cheaper local builder.
+# [[leaves.builder_escalation]]
+# min_iteration = 2          # 2nd attempt onward → a stronger model
+# argv = ["claude", "-p", "--agent", "builder", "--model", "opus", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+# Difficulty-routed builder variants (issue #134) — optional. Route the Do backend per
+# bundle from the brief's `Difficulty` field (the planner's blast-radius assessment, #133),
+# so a cheap local model handles easy bundles and a stronger one is reserved for the hard
+# ~20%. Each entry's `when = {field, substring}` matches a brief field (like a gate target);
+# the FIRST match wins, an absent/unknown field falls back to [leaves.builder] (default-open
+# — a missing tag never reduces capability), and the escalation ladder above OVERRIDES the
+# variant on iterate. SAFETY: calibrate before you narrow — run the would-be-skipped path on
+# a sample of low/medium bundles and confirm ~0 NEEDS-HUMAN on "low" before trusting it.
+# A variant may also carry `model = "<name>"` so a brief pins it EXPLICITLY via
+# `- **Do model:** <name>` (issue #167) — an explicit per-bundle choice that OVERRIDES the
+# `when` routing (e.g. force a privacy-sensitive bundle onto a local backend regardless of
+# difficulty); a `Do model` naming no variant `model` falls back to the `when` routing.
+# [[leaves.builder_variant]]
+# model = "frontier"
+# when = { field = "difficulty", substring = "high" }
+# argv = ["claude", "-p", "--agent", "builder", "--model", "opus", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+# Check reviewer (advisory; build-notes withheld via a sandbox). Cross-vendor
+# decorrelation is the default and the ideal — a DIFFERENT family from the builder
+# (INTEGRATION §4). `--agent reviewer` (same family as the builder) is the
+# documented FALLBACK only; it weakens the independence Check relies on.
+# The cheap-model SIZE judgment (issue #320) — advisory, optional, off by default.
+#
+# Answers the one question the structural estimator provably cannot: how many
+# INDEPENDENTLY SHIPPABLE outcomes does this brief describe? Structure (sizing.py,
+# calibrated against a real 86-bundle corpus) predicts patch size well and churn weakly;
+# neither tells you whether a slice DECOMPOSES, and that is what justifies a split.
+#
+# `mode = "stub"` ships deliberately: taking a `copier update` must never switch on a model
+# call — and a per-Plan cost — an instance did not ask for. Switch to "command" to enable.
+# Its verdict can only ever RAISE the driver's band, never lower it (sizing.combine).
+# The SPLITTER (issue #322) — interactive, invoked by `nl-shell-pdca split <id>`.
+#
+# Reads brief.md plus the driver's size estimate and writes exactly ONE file,
+# split-proposal.md: N child slices, each a full draft brief, each carrying `Depends on:` /
+# `Conflicts with:` naming its SIBLINGS by proposal-local label. Those ordering fields are
+# the point — get them right and `compute_waves` needs no new code: independent children
+# run in one parallel wave, dependent ones stack.
+#
+# It proposes seams and never cuts them: no bundles, no branches, no tracker calls.
+# `nl-shell-pdca split <id> --accept` is the deterministic half: it files one tracker issue per child
+# as a SUB-ISSUE of the parent, materializes a bundle each, and the run continues into waves
+# by itself (#358). Pass `--ids 640,641` instead when the issues already exist — or when the
+# tracker is not a GitHub one this can reach, in which case it says so rather than skipping.
+# The parent's tracker issue stays open until its children are done (#545): once the
+# parent's bundle is COMPLETE and every child issue is closed, `nl-shell-pdca cleanup
+# --apply` closes it with a comment naming every child — as completed if at least one child
+# was completed, else as not planned. (A parent whose bundle ends DISCONTINUED is not held
+# open: cleanup closes it as not planned.) A bundle already two splits deep (lineage depth
+# 2 or more) is not split again unless the human passes `--force` to `--accept`.
+[leaves.splitter]
+mode = "stub"
+family = "claude"
+interactive = true
+agent = "splitter"
+argv = ["claude", "--agent", "splitter", "--permission-mode", "acceptEdits"]
+
+[leaves.sizer]
+# Switch `mode` to "command" to enable — the argv below is ACTIVE so that one edit is
+# enough. `--allowedTools Read Write`: the leaf reads brief.md and must WRITE sizing.json,
+# and a Read-only grant would let it run and produce nothing.
+mode = "stub"
+family = "claude"
+interactive = false
+agent = "sizer"
+argv = ["claude", "-p", "--agent", "sizer", "--allowedTools", "Read", "Write", "--model", "haiku"]
+
+# Escalation on the sizer's OWN first-pass verdict — runtime state, not a brief field,
+# which is why this is an escalation rather than a variant. A `watch` or low-confidence
+# answer is exactly when a stronger model earns its cost; nothing in the brief predicts it.
+# At most one escalation runs: this is a corroborating signal, not a search.
+#
+# [[leaves.sizer_escalation]]
+# on_band = ["watch"]
+# on_confidence = ["low"]
+# effort = "medium"
+# argv = ["claude", "-p", "--agent", "sizer", "--allowedTools", "Read", "Write", "--model", "sonnet"]
+
+[leaves.reviewer]
+mode = "stub"
+family = "codex"
+interactive = false
+# Role prompt: canonical body agents/reviewer.md, inlined for codex / resolved via
+# `--agent reviewer` for claude. (AGENTS.md now carries general codex project context.)
+agent = "reviewer"
+# `codex exec --sandbox workspace-write` — the reviewer re-runs red/green evidence
+# (git stash/unstash) and re-checks path:line on $PDCA_TARGET, which the driver grants as a
+# writable root via the family's --add-dir grounding. The role prompt forbids writing the FIX.
+# --skip-git-repo-check: the reviewer's cwd is a temp SANDBOX (not a git repo), which codex
+# exec otherwise refuses to run in ("Not inside a trusted directory").
+argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"]
+
+# Interactive leaves — the human-in-the-loop touch points (Plan, Sign-off, Publish,
+# Act) hand the terminal to a seeded model+human REPL, chosen by `interactive_family`
+# (claude). Claude gets a `claude --agent <name>` REPL; codex gets a
+# `codex` TUI (workspace-write, so edits don't each need approval — the human is present)
+# with the role prompt (agents/<name>.md) inlined via the `agent` key. Independent of the
+# builder/reviewer family above.
+# REMOTE CONTROL — answer an interactive leaf from another device (issue #337).
+#
+# The four leaves below (planner, sign-off, publisher, Act) hand the terminal to a REPL and
+# BLOCK there, so a rendered instance inherits a hard constraint that is easy to miss: the
+# human must be sitting at the terminal the flow runs in, for the whole batch. A `nl-shell-pdca flow`
+# over six bundles can park on one sign-off adjudication for hours because nobody is at that
+# machine.
+#
+# Claude Code's `--remote-control` removes it. Each interactive leaf is its own `claude`
+# subprocess with argv taken straight from this file, so enabling Remote Control in your OWN
+# shell does NOT reach them — which is exactly why this is worth writing down rather than
+# leaving to be discovered.
+#
+# To enable, APPEND the flag to the argv line below — do not add a second `argv = [...]`,
+# which would be a duplicate key the moment you uncomment it. Put it anywhere but LAST:
+# the driver seeds every interactive leaf by appending the prompt as one positional after
+# this argv, and `--remote-control` takes an optional [name] value — as the final token it
+# swallows the whole seed as the RC session name (RC fails with "check the debug log" and
+# the REPL opens unseeded, issue #396). The same holds for ANY flag with an optional
+# value, so none may sit last. The claude spawn inserts `--` before the seed as a
+# backstop; non-last placement is the posture every family supports.
+#
+#   argv = ["claude", "--remote-control", "--agent", "planner",
+#           "--permission-mode", "acceptEdits"]
+#
+# The device must be enrolled first (`/login`). Left off by default because a flag that
+# makes a leaf refuse to start would block the flow on the one path that cannot be retried
+# unattended.
+#
+# CLAUDE-ONLY, and interactive-only. It applies to the `claude` interactive command, not
+# generically to every backend. The headless builder/reviewer must NOT carry it: it starts
+# an *interactive* session and they have no human to reach.
+[leaves.planner]
+mode = "stub"
+family = "claude"
+interactive = true
+agent = "planner"
+argv = ["claude", "--agent", "planner", "--permission-mode", "acceptEdits"]
+
+[leaves.signoff]
+mode = "stub"
+family = "claude"
+interactive = true
+agent = "signoff"
+argv = ["claude", "--agent", "signoff", "--permission-mode", "acceptEdits"]
+
+[leaves.act]
+mode = "stub"
+family = "claude"
+interactive = true
+agent = "act"
+argv = ["claude", "--agent", "act", "--permission-mode", "acceptEdits"]
+
+# Publisher — Check's closing step: writes commit-msg.txt + pr-description.md (the
+# git/draft-PR mechanics are deterministic code in pdca_harness.publish). A non-claude
+# publisher gets the driver's `gh` STOP-shim (guard.py) since it has no PreToolUse hook.
+[leaves.publisher]
+mode = "stub"
+family = "claude"
+interactive = true
+agent = "publisher"
+argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
+
+
+# FAMILY PROFILES (vendor neutrality). Every vendor-CLI-specific behavior is DATA
+# (pdca_harness.families): how to stream, how to grant an extra read dir, how a role
+# prompt is injected, whether the CLI must run from the harness root, whether it has
+# its own STOP-discipline hook. Built-ins ship for claude / codex / gemini / generic;
+# any UNKNOWN family name falls back to generic (prompt on stdin, no vendor flags),
+# and a non-claude BUILDER automatically gets the driver's `gh` PATH-shim guard —
+# the same builder_guard.py rules as claude's PreToolUse hook, vendor-neutrally.
+# Override or extend per instance; adding a vendor is config, not a driver change:
+# [families.mycli]
+# grounding_flag = "--include-directories"   # "" ⇒ env-only ($PDCA_TARGET/$PDCA_WORKTREE)
+# role_injection = "inline"                  # "flag" | "inline" | "none"
+# stream_argv = []                           # flags for a live tool-use stream, if any
+# cwd_discovery = false                      # true ⇒ run from harness root (claude-style)
+# native_guard = false                       # true ⇒ skip the driver's gh PATH shim
+#
+# Any leaf may also carry, mapped through its family's profile (explicit argv wins):
+#   agent  = "reviewer"   # role prompt: canonical body is agents/<name>.md. Claude passes
+#                         # `--agent <name>` (reads .claude/agents/<name>.md, the frontmatter
+#                         # wrapper generated from that body); inline families read the
+#                         # agents/<name>.md body and prepend it to the task prompt
+#   model  = "<id>"       # → the profile's model_flag (claude --model, codex/gemini -m)
+#   effort = "high"       # → the profile's effort_argv mapping
+#
+# Example: a Gemini CLI advisory reviewer (grounded via --include-directories, role
+# prompt inlined — no claude machinery needed):
+# [[leaves.advisory]]
+# id = "gemini"
+# role = "correctness bugs introduced by the patch"
+# mode = "command"
+# family = "gemini"
+# agent = "code-review"
+# argv = ["gemini", "--yolo"]
+
+# Optional advisory reviewer leaves (issue #64) — an OPEN list. The `reviewer` leaf above
+# judges fix ADEQUACY (causal adequacy, scope, validation); add role-distinct ADVISORY
+# reviewers here for other lenses (e.g. correctness bugs the patch introduces + reuse /
+# simplification / efficiency cleanups). Each writes check-advisory-<id>.md; its
+# `- NEEDS-HUMAN —` findings route into SUMMARY §6. Always advisory — never gates.
+# Decorrelate: prefer a `family` distinct from the builder AND the reviewer where you can.
+# `when = { field = "<brief field>", substring = "<v>" }` runs it only when that brief
+# field matches (e.g. a "Review depth" field an Act rule tunes) — omit to always run.
+# [[leaves.advisory]]
+# id = "code-review"
+# role = "correctness bugs introduced by the patch + reuse/simplification/efficiency cleanups"
+# mode = "stub"
+# family = "claude"
+# argv = ["claude", "-p", "--agent", "code-review", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
+# when = { field = "review depth", substring = "deep" }
+#
+# A second reference lens — an ADVERSARIAL reviewer (issue #151) that tries to REFUTE the
+# red→green evidence and the reviewer's verdict (defaults to "refuted" when uncertain),
+# gated to the highest blast-radius bundles via the Difficulty signal (#133). Advisory —
+# never gates; its `- NEEDS-HUMAN —` findings route into SUMMARY §6.
+# [[leaves.advisory]]
+# id = "adversary"
+# role = "refute the red→green evidence and the reviewer's verdict; find the input that breaks the fix"
+# mode = "stub"
+# family = "claude"
+# argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
+# when = { field = "difficulty", substring = "high" }
+#
+# Advisory-selection policy (issue #64 default vs. issue #200). Unset ⇒ every advisory leaf
+# above whose `when` matches runs. Opt into `vendor-complement` to make cross-vendor
+# decorrelation (INTEGRATION §4) automatic: the driver treats the [[leaves.advisory]] list
+# as a VENDOR POOL and runs the SINGLE leaf whose `family` differs from the builder that
+# actually ran — read from the bundle's loop-telemetry.json, so it holds whether the backend
+# came from `Do model` (#167), difficulty routing (#134) or escalation (#135). So a bundle
+# built with Codex gets a Claude advisory and one built with Claude gets a Codex advisory,
+# with no per-brief edits. Declare one differently-`family` entry per vendor above (same
+# `role`); if none differs from the builder (or the builder family is unknown) it falls back
+# to the first applicable leaf — a same-vendor review beats none — and files the lapse as a
+# §6 NEEDS-HUMAN so you can see decorrelation didn't hold for that bundle.
+# [leaves.advisory_selection]
+# mode = "vendor-complement"
+
+# Plan-beat advisory reviewers (issue #301) — the same open-list mechanism at PLAN: right
+# after the planner writes brief.md, each [[leaves.plan_advisory]] leaf reviews the BRIEF
+# (brief + notes + sources — no patch exists yet) as an ANTAGONIST of the plan: wrong
+# root-cause framing, an unverifiable success criterion, hidden scope, an unresolvable
+# target/dependency, ignored tracker context. Findings are `- NEEDS-HUMAN —` bullets in
+# plan-advisory-<id>.md; the planner then gets ONE bounded revision pass, and the bundle
+# records plan-advisory-benefit.json (findings count + whether the brief was revised) —
+# surfaced in SUMMARY §10 so Act can judge over cycles whether plan reviews pay off, and
+# as a §6 item when findings were left unrevised. Add extra vendor entries (a codex/gemini
+# `family` + argv) to build a VENDOR POOL; with the selection below the driver runs the
+# single leaf whose family differs from the PLANNER's (the brief's author — pre-Do there
+# is no builder telemetry), so plan validation is cross-vendor automatically; no
+# different-family leaf ⇒ same-vendor fallback + a decorrelation note. Advisory — never
+# gates; off (commented) by default.
+#
+# `--allowedTools` below deliberately leaves out `Write`, though the plan-reviewer agent has
+# it (issue #526): Write is how it still delivers its review on a host where the sandbox
+# cannot start and every Bash call fails. `acceptEdits` already lets it write in its own
+# working directory, and the harness denies file edits on the pinned target and on the
+# bundle. Listing `Write` here would pre-approve it for EVERY path — observed: it then
+# overwrote a file outside all of the leaf's granted directories.
+# [[leaves.plan_advisory]]
+# id = "plan-reviewer"
+# role = "refute the brief: wrong root cause, untestable success criterion, hidden scope"
+# mode = "stub"
+# family = "claude"
+# argv = ["claude", "-p", "--agent", "plan-reviewer", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
+# when = { field = "difficulty", substring = "high" }
+#
+# [leaves.plan_advisory_selection]
+# mode = "vendor-complement"   # anchor: the PLANNER family (the brief's author)
+
+# Sandbox exemptions for the Check leaves (issue #276). The reviewer / advisory leaves run
+# under Claude Code's sandbox, which denies the DOCKER SOCKET. So a conformance gate that
+# brings up a live cluster (`docker compose` → etcd / TiKV / FDB) is permission-denied inside
+# the leaf EVEN ON A DOCKER-CAPABLE HOST: the runtime leg skips, its evidence can never be
+# earned at Check, and it defers to a human-run confirmer on every bundle — the process turns
+# burdensome exactly where it should be mechanical.
+#
+# List those commands here and ONLY THEY run outside the sandbox. Every other Bash line the
+# leaf writes stays fully confined. This is deliberately NOT a socket-wide grant: opening all
+# unix sockets would let ANY command the leaf runs reach the docker daemon, and a root-owned
+# daemon (the common setup — check `ls -l /var/run/docker.sock`) is effectively root on the
+# host. Name the command; don't open the socket.
+#
+# Match the command you actually gate on, as precisely as you can — this is a capability, so
+# a loose pattern (`docker *`) hands the leaf far more than a specific one.
+#
+# "ONLY THEY" is ENFORCED, not merely intended — it takes three things, because a list of names
+# on its own bounds nothing:
+#   0. There must BE a sandbox. `sandbox.enabled` defaults to FALSE, and (2) below drops your
+#      user-scope settings — where an operator's `enabled = true` normally lives — so without
+#      seeding it, bounding the exemption would REMOVE the sandbox it claims to bound, and
+#      EVERY command would escape. Nor does the sandbox fail closed on its own: with its
+#      dependencies (bubblewrap, socat) missing it DISABLES itself, warns, and runs everything
+#      unconfined. So the harness seeds `enabled = true` AND `failIfUnavailable = true` (which
+#      only has effect when enabled is true), and the leaf REFUSES to start rather than run
+#      unconfined. `nl-shell-pdca doctor` checks those dependencies before a run (required rows) — run it.
+#   1. The harness seeds `allowUnsandboxedCommands = false` beside the list. Claude Code
+#      defaults it to TRUE, and while true the model may retry ANY sandbox-denied command with
+#      `dangerouslyDisableSandbox` and have it run unconfined.
+#   2. The leaf runs with `--setting-sources project`, so it loads ONLY the settings the
+#      harness seeds. Array settings CONCATENATE across scopes, and the union is monotonic —
+#      nothing can remove what a lower scope added — so YOUR OWN `~/.claude/settings.json`
+#      `excludedCommands` (your interactive exemptions) would otherwise merge straight into the
+#      leaf, and this list would be a floor rather than a ceiling.
+#
+# THE ONE SCOPE THE HARNESS CANNOT BOUND: enterprise managed policy. `--setting-sources` excludes
+# user and local settings, but Claude Code ALWAYS loads `managed-settings.json` regardless — and
+# arrays only ever concatenate. So a managed policy carrying `sandbox.excludedCommands` widens the
+# leaf's exemption and NOTHING the harness can do will narrow it. The list is a ceiling with
+# respect to YOUR settings, not your ORGANISATION's. If your org sets one, read it before relying
+# on this boundary.
+#
+# The cost of (2): the leaf no longer reads your user-scope settings at all. If your AUTH lives
+# there (`apiKeyHelper`, or `env.ANTHROPIC_API_KEY`), move it into the environment or the leaf
+# will fail to start. It fails loudly, and the error lands in the bundle's `*.error.log`.
+#
+# Claude-family leaves only: codex does not read the settings the harness seeds, so it can be
+# given neither a per-command exemption nor the confinement that bounds one. The harness REFUSES
+# this key there rather than hand out an unbounded grant — use `network_access` below instead.
+#
+# HARDENING: a rootless daemon (podman, or rootless dockerd) makes socket access user-level
+# rather than root-level, which de-fangs the whole class of risk. Prefer it where you can.
+#
+# Empty (the default) ⇒ no exemptions; the leaf is fully sandboxed and a Docker-backed leg
+# will skip and defer to a human (today's behaviour).
+#
+# BOTH sandbox keys live under the ONE `[leaves.sandbox]` table below — see `network_access`,
+# documented next. They are independent opt-ins, but TOML forbids declaring the same table
+# twice, so uncomment the header ONCE and put both keys under it.
+
+# `network_access` — the CODEX-shaped grant, and the only way a codex leaf reaches Docker.
+#
+# codex's `--sandbox workspace-write` has no per-command escape, and its refusal of the docker
+# socket is NOT a filesystem denial: a relayed socket in a directory codex can write is refused
+# just the same. It is the seccomp/network layer. So no path grant fixes it — only opening that
+# layer does. It also reaches api.github.com, settling the reviewer's prior-art check (#277).
+#
+# THE TWO GRANTS HAVE DIFFERENT SHAPES, and neither is strictly tighter — which is exactly why
+# this is a SEPARATE key. Naming a command never implies the network grant:
+#
+#   claude  unsandboxed_commands  a NAMED command leaves the sandbox entirely (filesystem too);
+#                                 every other command stays confined.
+#   codex   network_access        the SOCKET/NETWORK layer opens for EVERY command in the leaf
+#                                 (no per-domain scoping); the FILESYSTEM stays confined for
+#                                 every command.
+#
+# `unsandboxed_commands` promises "ONLY THEY run outside the sandbox" — a promise this grant
+# would not keep, since it frees the network for every command the leaf writes. So opt into each
+# one deliberately. Both are moot against a ROOT-OWNED daemon: anything that can talk to that
+# socket can start a container with `-v /:/host`, so codex's retained filesystem confinement
+# buys little there. Rootless is the real answer for either family.
+#
+# false (the default) ⇒ the codex leaf's network stays closed; a Docker-backed leg skips and
+# defers to a human (today's behaviour).
+#
+# ONE table, BOTH keys — uncomment only the lines you need. A second `[leaves.sandbox]` header
+# makes tomllib refuse the file ("Cannot declare ('leaves','sandbox') twice") and the driver
+# will not start at all (PR #292 review). Also note `network_access` must be the UNQUOTED
+# boolean `true`; a quoted "true"/"false" is rejected and the grant stays closed.
+# [leaves.sandbox]
+# unsandboxed_commands = ["cargo xtask fdb-conformance", "cargo xtask etcd-conformance"]  # claude
+# network_access = true                                                                    # codex
+
+# Doctor rows (`nl-shell-pdca doctor`) — optional. The doctor derives its main checks from
+# this file (every command leaf's CLI + auth, gh, bundle root, notes_cmd); declare
+# INSTANCE-specific prerequisites here as data, the same pattern as [[gates.checks]].
+#
+# The built-in workspace section also WARNs when free disk space under the project root
+# drops below [doctor].min_free_gb GiB (issue #297 — quota exhaustion mid-gate produces
+# an arbitrary failing test name, misattributed to the patch). 0 disables the row.
+# [doctor]
+# min_free_gb = 10.0
+# Each cmd runs from the project root; exit 0 = OK. A row a brief's `External
+# dependencies` token names is ALSO executed by the pre-dispatch dependency guard
+# ([driver].dependency_guard, default "hold"): a non-zero exit holds that bundle before
+# Do dispatches, quoting the row's hint. Those detect cmds run on every beat the policy
+# is consulted — not just on `nl-shell-pdca doctor` — so keep them cheap and
+# side-effect-free: a probe is a read, never a provisioning step
+# ([install].extra_bootstrap owns provisioning). Fields:
+#   group     optional section header the row prints under (e.g. "engine")
+#   level     status when the cmd FAILS — "WARN" for optional, default "MISSING"
+#   required  a failing required row makes the doctor exit non-zero
+#   per_lane  expand the row once per [driver].lane: {lane} → 0..lanes-1,
+#             {lanes} → the count (nothing when lanes ≤ 1). {lanes} substitutes
+#             in every row, so a hint can read "make worktrees LANES={lanes}".
+# [[doctor.checks]]
+# group = "engine"
+# id = "docker"
+# cmd = "docker info"
+# hint = "https://docs.docker.com/engine/install/ — the gates run in a container"
+# level = "WARN"
+# [[doctor.checks]]
+# group = "workspace"
+# id = "lane worktrees lane{lane}"
+# cmd = "test -e ../repo-lane{lane}/.git"
+# hint = "make worktrees LANES={lanes}"
+# per_lane = true
+# level = "WARN"
+
+# Deterministic Check gates (docs 04). Each check runs a shell command; it PASSES
+# iff the command exits 0. `scope = "repo"` runs against the working tree (and is
+# what CI re-runs via `nl-shell-pdca gates --working-tree`); `scope = "bundle"` needs the
+# bundle/patch context ($PDCA_BUNDLE is exported) and runs only locally. The
+# SAME commands run for the local driver and CI — single-sourced, no drift.
+# With worktree isolation on ([driver].worktree), $PDCA_WORKTREE is also exported —
+# the isolated tree Do edited; a bundle-scoped gate should test THAT, not the host
+# checkout (e.g. `cd "$PDCA_WORKTREE" && <run the test>`).
+#
+# TARGET-AWARE SELECTION (optional). A check may carry `target` — a label or a LIST;
+# it runs iff its labels are a SUBSET of the bundle's label set (subset = AND). The
+# bundle is classified from its brief on two axes:
+#   * PRIMARY (mutually exclusive, e.g. core vs addon): `[gates.target_match]` maps a
+#     label → substring matched (case-insensitively) against "Repo + branch target",
+#     `target_default` is used when none match.
+#   * FLAGS (additive, e.g. frontend): `[gates.target_flags]` maps a label →
+#     {field, substring} matched against ANY brief field (a bare string ⇒ the
+#     "Repo + branch target" field).
+# Unset ⇒ no filtering (every gate runs). E.g. skip core suites on an addon-only fix,
+# and run a GUI/E2E gate only for a *frontend* change (core OR addon):
+#   [gates]
+#   target_default = "core"
+#   [gates.target_match]
+#   addon = "addons-source"
+#   [gates.target_flags]
+#   frontend = { field = "surfaces", substring = "gui" }
+# then tag gates: core suite `target = "core"`, addon suite `target = "addon"`, GUI
+# smoke `target = "frontend"`, an addon-in-GUI E2E `target = ["addon", "frontend"]`.
+# `nl-shell-pdca gates --working-tree` (no bundle) is never filtered, so the CI re-gate is unaffected.
+#
+# While `checks` is empty the driver uses built-in all-PASS stubs so the offline
+# slice runs. Fill these in as your gate tiers get written (gates are the long
+# pole — build them first). Gate commands live in your project's verification
+# engine under `engine/` (see engine/README.md). Example:
+#
+# C4 — the per-fix CORRECTNESS gate (bundle-scoped, GATING). Applies the bundle's
+# patch.diff and runs ONLY its test, asserting red-without-fix / green-with-fix.
+# This is what makes a cycle mean something — it validates THIS change.
+#
+# THE BASE LADDER (issue #474) — `$PDCA_BASE` / `$PDCA_VERIFY_BASE` / `$PDCA_BRIEF_BASE`,
+# the base a per-fix verifier resets to before applying `patch.diff` — is exported to this
+# row ONLY, never to any other configured row (repo-scoped or bundle-scoped). A row is the
+# verifier iff `verifies_base = true` is set explicitly, OR (undeclared) iff its `tier` is
+# `"C4"` — which the row below already is, so this default costs a rendered instance
+# NOTHING: your existing C4 row keeps receiving the base with no edit here. Give a
+# differently-tiered row `verifies_base = true` only if IT is the one that resets to and
+# tests against the base (rare — most projects have exactly one such row, this one).
+# [[gates.checks]]
+# id = "C4-verify"
+# tier = "C4"
+# label = "fix verified: test red pre-fix, green post-fix"
+# cmd = "./engine/scripts/run-verify.sh"
+# gating = true
+# scope = "bundle"
+#
+# T3 — a whole-suite runtime gate on the UNMODIFIED tree. Ship it ADVISORY
+# (gating = false): a checkout with any pre-existing failure is red as a baseline
+# and never sees the bundle's patch, so it cannot gate a single fix — C4-verify
+# above is the per-fix gate. Re-gate once the suite is green-baseline.
+# [[gates.checks]]
+# id = "T3-suite"
+# tier = "T3"
+# label = "runtime: whole test suite (baseline)"
+# cmd = "./engine/scripts/run-suite.sh"
+# gating = false
+# scope = "repo"
+#
+# A reference C5 ADVISORY check (issue #154): does the bundle's shipped test exercise
+# PRODUCTION, or a hand-ported copy? The script asserts each added test file in the patch
+# imports the production package (PDCA_PROD_PACKAGE = the production import root, e.g.
+# `gramps`); when it can't confirm it declares itself UNVERIFIABLE → SUMMARY §6 for the
+# human to adjudicate. A Python/import heuristic — tune the package + test-file pattern.
+# [[gates.checks]]
+# id = "C5-prod-path"
+# tier = "C5"
+# label = "test exercises the production path (not a copy)"
+# cmd = "PDCA_PROD_PACKAGE=yourpkg python3 scripts/checks/test_exercises_production.py"
+# gating = false
+# scope = "bundle"
+#
+# GATING POLICY (learned the hard way): default a tier to ADVISORY (gating =
+# false). The per-fix C4 (red→green) is the one gate that ships gating = true —
+# runtime, conformance (T1/T2/T4), and interface/E2E tiers all audit code the
+# *current* fix did not introduce, so gating them on pre-existing/legacy
+# non-conformance is wrong. Promote a tier to gating once its targeted artifacts
+# are clean — give a check `promote_after = N` and `nl-shell-pdca gates --promotions` lists the
+# advisory checks that passed in their N most-recent frozen cycles (earned promotion; you
+# flip `gating`, nothing is auto-mutated). For interface/E2E, gate a SMOKE test ("does the
+# app start"), not the
+# full suite — the full suite mixes green tests with known-bug repros, so it is a
+# characterization, not a pass/fail signal. Cite each tier's rules back to the
+# project's normative ruleset (docs/INTEGRATION.md §4) so the gate is auditable.
+#
+# TIMEOUTS (issue #368). A gate command with no bound can hang the Check beat
+# indefinitely — the heartbeat keeps printing "… still working", so a genuinely hung
+# gate never LOOKS hung (measured: an advisory row held a Check beat for 19h). Give a
+# row `timeout_secs = N` (wall-clock seconds), and/or set a `[gates]`-level fallback:
+#   [gates]
+#   default_timeout_secs = 3600  # one hour, for every row without its own bound
+# On expiry the command's whole process group is terminated and the row is recorded
+# UNVERIFIABLE ("gate exceeded its Ns timeout") → SUMMARY §6 NEEDS-HUMAN — the oracle
+# did not answer, which is not a pass/fail verdict. `timeout_secs = 0` on a row opts
+# that row out of the fallback; nothing configured ⇒ unbounded, exactly as before.
+#
+# CONFIRM-ONCE (issue #371). At Check, a GATING row that fails with a real exit code is
+# re-run once (same command, env, cwd and timeout) before it is recorded. Fail→pass is
+# recorded `pass` + `flaky = true` and becomes a HUMAN item in SUMMARY §6 naming both
+# outcomes, so C6 still makes you look at the red sample; fail→fail stays `fail` (with the
+# second run's evidence); a second run that times out / is unverifiable / deferred /
+# cannot start leaves the first `fail` standing. The row's `attempts` and its
+# gate-logs/<id>.log record both runs. Only Check confirms — publish's host-CI gate and the
+# integration / working-tree re-gates still run a failing row once. On by default:
+#   [gates]
+#   confirm_gating_fail = false   # turn it off for every row
+# or per row, on a `checks` entry or a `host_ci` table entry: `confirm_fail = false`.
+# UPGRADE NOTE: a model-backed gate row (e.g. a whole-diff model review) SHOULD set
+# `confirm_fail = false` — a second run is a fresh sample, not a re-check of the first.
+#
+# DELEGATED GATES (issue #67). If your project already single-sources its gates in its
+# own runner, point `runner` at it and give each check a bare `subcmd` instead of a full
+# `cmd`; PDCA runs `<runner> <subcmd>` and treats the host runner as the source of truth
+# (it never re-declares the gates). A missing runner surfaces as a clear failing row, not
+# a crash. A full `cmd` (e.g. `cmd = "cargo xtask ci"`) still works for wholesale delegation.
+[gates]
+
+checks = [
+  # T4 Contribution — lint the publisher's two artifacts before they are pushed: the PR body
+  # must open with a `**User impact:**` line (the user-visible effect, before Root cause) and
+  # both commit-msg.txt + pr-description.md must carry the tracker id. `contribcheck` reads
+  # $PDCA_BUNDLE; before the artifacts are drafted it has nothing to lint, so it DECLARES the
+  # deferral (`PDCA-DEFERRED:`, exit 0) and the Check row records `deferred — re-gated at
+  # publish` rather than a green nobody can reproduce (issue #401; docs 04 §Gate result
+  # vocabulary). `nl-shell-pdca publish` then hard-gates T4 after drafting them — the
+  # substantive verdict, in BOTH modes: under `publish --no-issue` the runner exports
+  # $PDCA_PENDING_ID (derived from the flag on each run, never inherited) and `contribcheck`
+  # honours it as `--no-issue`, so the checker drops exactly the not-yet-assigned tracker-id
+  # requirement and everything else still blocks the push (issue #384; the mode travels via
+  # the environment, not an edit to the row below — rewriting that registered line in place
+  # would conflict on `copier update` for any instance that appended a row beside it,
+  # tests/test_update_compat.py).
+  # Gating is right here — this audits THIS cycle's own contribution artifacts,
+  # not pre-existing code, so the usual "T4 advisory" caveat (below) does not apply.
+  # `at_publish` (issue #339) — whether `nl-shell-pdca publish` re-runs this row before pushing.
+  # Defaults from `scope`: a BUNDLE-scoped T4 row is about the bundle's own contribution
+  # artifacts, so it runs at publish (the row below); a REPO-scoped one cannot be, so it
+  # does not. Set it explicitly to override in either direction.
+  #
+  # Register a whole-diff model review at T4 and you want `at_publish = false`: Check has
+  # already paid for it, and re-running a NONDETERMINISTIC reviewer after the human signed
+  # off means a bundle green at Check can be refused at publish over a finding that did not
+  # exist when §9 was recorded.
+  { id = "T4-contribution", tier = "T4", label = "PR body has a user-impact opener + tracker id in both artifacts", cmd = "nl-shell-pdca contribcheck", gating = true, scope = "bundle" },
+]
+
+
+# Host-only CI parity (issue #311). CI jobs the host runs on EVERY PR but the delegated
+# gate runner does not cover (a spell-checker like `typos`, a docs lint). The T4 slot runs
+# BEFORE patch.diff is applied, so it structurally cannot see prose that arrives in the
+# patch — a bundle can pass Check green and open a PR that immediately fails a required
+# status. Declare those commands here and the harness runs each one FROM a reconstructed
+# base + patch.diff tree, at two seams:
+#   * at Check, as gate rows (defaults: tier "T4", bundle scope) against the same lane
+#     worktree the bundle-scoped gates trust (#296) — a red lands in check-gates +
+#     SUMMARY §6 where sign-off sees it;
+#   * again in `nl-shell-pdca publish`, immediately before anything is pushed: the
+#     harness re-FETCHES, PINS the exact base commit the push will build on, materializes
+#     base + patch.diff in an ephemeral worktree at that commit, runs the commands there,
+#     and builds the pushed branch on that same commit — so a green certifies the very
+#     tree being pushed even when the base advanced since Check. ANY command that does
+#     not pass — any non-zero exit, exit 77 included — blocks the push (no branch, no
+#     PR) and is recorded in the bundle's host-ci.json naming the command and the base.
+# A bare string is shorthand for { cmd = "..." }; a table row may also set id / label /
+# tier. `gating` is forced true (the host's CI will fail the PR on these regardless, so
+# an advisory row would re-open the exact observed gap). The target must be a git
+# checkout; at Check without a patched worktree the rows read UNVERIFIABLE (→ §6), and
+# publish refuses rather than push content the declared CI never saw. Empty / absent
+# (the default) ⇒ byte-identical behaviour everywhere.
+# host_ci = [
+#   "typos",
+#   { id = "docs-lint", cmd = "make docs-lint" },
+# ]
+
+# Reverse registry-consistency (issue #205). The FORWARD direction (a source file a patch
+# adds must be registered in a manifest) is a project gate; this is the REVERSE, generic in
+# the harness: every line a patch ADDS to one of these manifest files must reference a path
+# the SAME patch touches. A registry line pointing at a file the patch never touches is
+# cross-bundle / build-tree contamination — the stored patch then fails to apply to its clean
+# publish base, yet passes Check. Name your manifest files here and wire the bundle-scoped
+# `registry-check` gate below; `pattern` (optional) is a regex whose first group extracts the
+# path from a non-bare-path manifest line (e.g. "^include (.+)$" for a MANIFEST.in) — omit for
+# bare-path manifests like POTFILES (the whole line is the path; blank / `#` lines ignored).
+# [gates.registry_consistency]
+# files = ["po/POTFILES.in", "po/POTFILES.skip"]
+# # pattern = "^include (.+)$"
+#
+# Then wire it as a bundle-scoped gate (T2 Shape). `registry-check` reads $PDCA_BUNDLE:
+# [[gates.checks]]
+# id = "T2-registry-reverse"
+# tier = "T2"
+# label = "manifest lines reference only paths the patch touches"
+# cmd = "nl-shell-pdca registry-check"
+# gating = true
+# scope = "bundle"
+

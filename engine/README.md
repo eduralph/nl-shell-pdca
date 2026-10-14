@@ -1,0 +1,85 @@
+# engine/ — the verification engine for nl-shell-pdca
+
+This directory holds the **project-specific verification engine**: the runners,
+helpers, and tooling the PDCA cycle invokes to *reproduce* a defect and *verify* a
+fix. It is the home that `pdca.toml` `[[gates.checks]]` `cmd`s and the
+`docs/INTEGRATION.md` §3 / §9 runners point at.
+
+The harness machinery — the driver, the state machine, the gate *runner* — is
+generic and lives in `src/pdca_harness/`. **What's in here is yours**: different
+projects verify differently (a Docker test suite, a native build, a headless GUI
+driver), so the template ships the convention and the wiring, not the engine.
+
+## Convention
+
+```
+engine/
+  scripts/        the runners gates invoke (run-verify.sh, run-suite.sh, …)
+  scripts/lib/    shared shell/python helpers (optional)
+  tests/          tests for the engine itself, so your runners don't rot
+```
+
+Gate `cmd`s in `pdca.toml` reference these by path, e.g.
+`cmd = "./engine/scripts/run-verify.sh"`. The **same** command runs locally (the
+driver) and in CI (`nl-shell-pdca gates --working-tree`) — single-sourced, no drift.
+
+## The two gate shapes that matter
+
+- **Per-fix correctness gate (C4)** — `scope = "bundle"`, `gating = true`. Applies
+  the bundle's `patch.diff` and runs ONLY its test, asserting **red without the
+  fix, green with it**. The driver exports `$PDCA_BUNDLE` (the bundle dir) to the
+  command. `scripts/run-verify.sh` is a skeleton for this — fill it in. This is the
+  gate that makes a cycle mean something: it validates *this* change.
+  - **Classify the patch's files first (issue #165).** The red leg reverts the
+    *production* change and expects the test to go red. A patch may also touch
+    **non-behavioral** files a project MUST update but that can't move the test —
+    translation manifests, file-registration lists, generated assets (e.g.
+    `po/POTFILES.{in,skip}`). Treat those as **non-production**: a patch whose only
+    non-test change is such a file has nothing to revert that would go red, so
+    `run-verify` must take the **`UNVERIFIABLE` (exit 77)** branch (→ §6 NEEDS-HUMAN,
+    non-gating), not a red→green it is guaranteed to fail. Otherwise a verify-first
+    bundle (bug already fixed upstream; the patch ships only the regression test + its
+    required manifest entry) gets a **false C4 fail**. Keep the non-production set as a
+    config list of path globs in your run-verify classification.
+  - **Judge each leg by two facts, not one — the exit code AND how many tests actually
+    ran.** A test runner exits non-zero both when the test ran and failed (the red leg's
+    proof) and when no test ran at all: it failed to compile/import/collect, or the runner
+    itself died. A leg that reads only the exit code cannot tell those apart, so it records
+    **PASS for a bundle whose test never executed** — the gate turning "no evidence" into
+    proof. That is an everyday shape, not a corner case: reverting the fix also removes any
+    symbol the fix introduced, so a test calling one fails to build on exactly that leg.
+    Parse a **count of executed tests** out of the runner's own report (TAP, JUnit XML,
+    `--format json`, `unittest -v`) and decide from both:
+
+    | runner exit | tests ran | verdict |
+    |---|---|---|
+    | 0 | 0 | `UNVERIFIABLE` (77) — nothing ran; no evidence either way |
+    | 0 | >0 | the test passed — green leg OK, red leg a **C4 fail** |
+    | non-zero | >0 | the test failed — the red leg's proof, green leg a **C4 fail** |
+    | non-zero | 0 | `UNVERIFIABLE` (77) — nothing ran; **never PASS**, it proves nothing |
+
+    A red leg that comes back green (exit 0, tests ran) is the honest C4 fail: the test
+    does not capture the defect. What must never happen is the last row read as a red.
+    Keep the two "nothing ran" reasons distinct in what you print (`runner exited 0:
+    nothing was selected` vs `runner exited <rc>: the test did not build/import`) — they
+    have different causes and the human reading §6 needs different things from each. The
+    rule generalises to **every** verification step, not just C4's red leg: a step in which
+    no test ran is `UNVERIFIABLE` (exit 77 → §6 NEEDS-HUMAN, non-gating), not a pass and
+    not a fail. A gate never turns "no evidence" into a verdict.
+- **Everything else is advisory by default** — `gating = false`. Runtime
+  (whole-suite T3), conformance (T1/T2/T4), and interface/E2E tiers all audit code
+  the *current* fix did not introduce, so gating them on pre-existing/legacy
+  non-conformance is wrong: a whole-suite run on the unmodified tree is red the
+  moment anything is broken, regardless of the patch. Ship these advisory and
+  **promote a tier to `gating = true` once its targeted artifacts are clean**.
+  - **Interface / E2E**: gate a **smoke test** ("does the app start"), not the
+    full suite — the full suite mixes green tests with reproductions of known
+    (often unmerged-upstream) bugs, so it's a characterization, not a pass/fail
+    signal. Run the full suite manually.
+
+Cite each tier's rules back to your project's **normative ruleset** (name it in
+`docs/INTEGRATION.md` §4) — a gate you can trace to a written source is auditable;
+one you can't is folklore.
+
+Replace the skeleton(s) here with your real runners, add their tests under
+`engine/tests/`, then wire them in `pdca.toml` `[[gates.checks]]`.

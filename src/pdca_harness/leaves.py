@@ -1,0 +1,4706 @@
+"""The model leaves — the only points where a model is invoked (docs 03 §leaves).
+
+The rest of the pipeline is deterministic code; models fill *artifacts*, never
+decide control flow. The cycle has exactly **four beats** (Plan · Do · Check · Act);
+the leaves are model touchpoints *within* those beats, not beats of their own — in
+particular review, sign-off and publish are all **steps of the Check beat**. The six
+leaves:
+
+* **planner** (Plan, interactive) — the human feeds documents (e.g. a tracker CSV)
+  and Claude writes ``brief.md``;
+* **builder** (Do, headless) — reads ``brief.md``, writes ``patch.diff`` + the
+  named test + ``build-notes.md``;
+* **reviewer** (Check — review step, headless) — advisory, decorrelated, writes
+  ``check-review.md``;
+* **signoff** (Check — sign-off step, interactive) — Claude reviews the result
+  *with* the human and records the decision token;
+* **publisher** (Check — publish step, interactive) — on an accepted bundle, writes
+  the contribution artifacts (the ``publish`` module does the git/draft-PR);
+* **act** (Act, interactive) — reviews frozen cycles and proposes process deltas.
+
+Two invariants live here and matter more than any prompt:
+
+1. **Independence is a missing input.** The reviewer never sees ``build-notes.md``.
+   In ``stub`` mode it simply isn't passed; in ``command`` mode the reviewer runs
+   in a temp sandbox containing *only* the reviewer inputs, so the file is
+   physically absent (a prompt instruction would not be enough).
+2. **The builder cannot mark a PR ready.** Enforced by the ``builder`` subagent's
+   tool scope + the ``builder_guard.py`` PreToolUse hook; the stub never does it.
+
+``mode == "stub"`` writes offline placeholders (no Claude/TTY). ``mode ==
+"command"`` runs the configured ``argv`` with the leaf's prompt appended, as a
+subprocess in the working dir; ``interactive`` leaves inherit the terminal.
+"""
+
+from __future__ import annotations
+
+import collections.abc
+import contextlib
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from collections import deque
+from collections.abc import Callable
+from pathlib import Path
+from typing import NamedTuple
+
+from . import act as act_mod
+from . import rubric as rubric_mod
+from . import sizing, split
+from . import assemble
+from . import brief
+from . import families
+from . import gates
+from . import guard
+from . import handoff
+from . import progress
+from . import sources
+from . import state
+from . import worktree
+from .config import Config, LeafConfig, memory_max_value
+
+# build-notes.md is DELIBERATELY ABSENT from this list (independence contract).
+# File names only — the round's `gate-logs/` directory is seeded alongside these by
+# `_seed_sandbox_gate_logs` (#403), so a check-gates.json row's `log` path resolves.
+REVIEWER_INPUTS = ["patch.diff", "brief.md", "check-gates.json"]
+
+# The interactive sign-off leaf writes its decision here; the flow reads it and
+# routes it through the C6-guarded signoff.record (never a model-written §9).
+SIGNOFF_DECISION = "signoff-decision"
+
+# Where a FAILED Do builder leaves its captured error tail (#279) — the Do-side twin of the
+# reviewer/advisory `check-*.error.log` (#138), so a failed batch can be post-mortem'd from
+# the bundle instead of terminal scrollback.
+BUILD_ERROR_LOG = "build.error.log"
+
+# Where the Do builder's memory-telemetry samples land (the #420 bound's observability
+# arm): one JSON line per heartbeat tick while the leaf runs inside its scope. The
+# reviewer/advisory leaves get the same file derived from their error log —
+# `check-review.error.log` → `check-review.memory.jsonl` (`_memory_log_for`).
+BUILD_MEMORY_LOG = "build.memory.jsonl"
+VALID_DECISIONS = frozenset({"accept", "iterate-do", "iterate-plan", "discontinue"})
+
+
+# ----------------------------------------------------------------------------
+# Subprocess invocation — the one place a leaf command is run.
+# ----------------------------------------------------------------------------
+class LeafError(subprocess.CalledProcessError):
+    """A headless leaf exited non-zero. Carries ``output`` — the captured stderr tail, plus
+    the leaf's own stream report of its death when there was one — so a failed leaf leaves
+    recoverable error text in the bundle (#138, #506), and ``produced`` — whether the
+    child did work that stands as its own (:func:`progress.run_with_heartbeat`).
+    ``produced is False`` covers the two shapes of a transient-infra death: the child died
+    at/near invocation, before emitting any work, where no report says why (a rate limit, a
+    5xx, a network blip); or its main session's last word was the CLI's own report of a
+    cause the vendor marks transient (a lost connection, an overload or 5xx, a passing
+    rate-limit rejection), however much work came first. Either way a retry is likely to
+    succeed — unless a signal ended it (:attr:`transient`). A spent usage limit is neither
+    shape: while the stream says the account's limit is refusing requests (a subscription
+    window that resets hours away), ``produced`` is ``True`` whatever the child did."""
+
+    def __init__(self, returncode: int, cmd, output: str = "", produced: bool = False):
+        super().__init__(returncode, cmd, output=output)
+        self.produced = produced
+
+    @property
+    def transient(self) -> bool:
+        """Worth another attempt: the leaf died of transient infra — before emitting any
+        work, or on its own report of a transient API error — and **not** of a signal
+        (#539). A signal death (the memory cap, the OOM killer, an operator's kill;
+        ``-signum`` or a wrapper's ``128 + signum``) repeats on every attempt, so having
+        said nothing first does not make it transient (#510). The harness's own timeout
+        (:data:`progress.TIMEOUT_RC`) is not a signal spelling and keeps its meaning. Nor is
+        a leaf transient whose stream says its usage limit is refusing requests: a spent
+        subscription window refuses every attempt until it resets, hours away, so
+        ``produced`` is ``True`` for it however the leaf died."""
+        return not self.produced and not progress.is_signal_death(self.returncode)
+
+
+
+def _role_injection(
+    cfg: Config | None, leaf: LeafConfig, profile: families.FamilyProfile,
+) -> tuple[list[str], str]:
+    """How the leaf's role prompt (``leaf.agent``) reaches the model: extra argv
+    (``role_injection == "flag"`` — the CLI resolves ``.claude/agents/<name>.md``
+    itself) or a prompt prefix (``"inline"`` — the file's body, frontmatter
+    stripped, prepended to the task prompt). Only active when the leaf names an
+    ``agent`` (backward compatibility: existing configs bake ``--agent`` into
+    argv and set no ``agent`` key). Best-effort: an unreadable role file degrades
+    to no injection, never a crashed leaf."""
+    if not leaf.agent or cfg is None:
+        return [], ""
+    if profile.role_injection == "flag":
+        if profile.agent_flag and profile.agent_flag not in leaf.argv:
+            return [profile.agent_flag, leaf.agent], ""
+        return [], ""
+    if profile.role_injection == "inline":
+        # The role prompt's canonical, vendor-neutral source of truth is `agents/<name>.md`;
+        # `.claude/agents/<name>.md` is Claude-only packaging (frontmatter + the same body)
+        # generated from it. Prefer the canonical file; fall back to the legacy
+        # `.claude/agents/` location for an instance rendered before the split. strip_frontmatter
+        # is a no-op on the frontmatter-less canonical body and still correct on the legacy one.
+        canonical = cfg.root / "agents" / f"{leaf.agent}.md"
+        legacy = cfg.root / ".claude" / "agents" / f"{leaf.agent}.md"
+        path = canonical if canonical.is_file() else legacy
+        try:
+            body = families.strip_frontmatter(path.read_text(encoding="utf-8")).strip()
+        except OSError as exc:
+            print(f"leaves: role prompt {path} unreadable ({exc}) — proceeding "
+                  "without it", file=sys.stderr)
+            return [], ""
+        # Migration guard (#228): a pre-split instance kept its role prompt ONLY in the legacy
+        # `.claude/agents/<name>.md` and may have CUSTOMIZED it. Now that the canonical file
+        # wins, those edits would be silently shadowed. If a legacy file exists and its body
+        # diverges from the canonical one we're using, say so — the fix is to migrate the edits
+        # into `agents/<name>.md` (the vendor-neutral source), not to leave them stranded.
+        if path == canonical and legacy.is_file():
+            try:
+                legacy_body = families.strip_frontmatter(legacy.read_text(encoding="utf-8")).strip()
+            except OSError:
+                legacy_body = body
+            if legacy_body != body:
+                print(f"leaves: {legacy} diverges from the canonical {canonical} and is being "
+                      f"ignored — migrate any customizations into agents/{leaf.agent}.md "
+                      "(the vendor-neutral role-prompt source).", file=sys.stderr)
+        return [], (body + "\n\n---\n\n") if body else ""
+    return [], ""
+
+
+def _mapped_argv(leaf: LeafConfig, profile: families.FamilyProfile,
+                 argv: list[str]) -> list[str]:
+    """argv additions from the opt-in per-leaf ``model`` / ``effort`` keys, mapped
+    through the family profile. Explicit argv is the escape hatch and always wins:
+    a flag already present in ``argv`` is never added twice."""
+    extra: list[str] = []
+    if leaf.model and profile.model_flag and profile.model_flag not in argv:
+        extra += [profile.model_flag, leaf.model]
+    if leaf.effort and profile.effort_argv:
+        rendered = [a.format(effort=leaf.effort) for a in profile.effort_argv]
+        # The dedup probe: a "--effort"-style flag, or the key of a "-c key=value" pair.
+        probe = rendered[0] if rendered[0].startswith("--") else rendered[-1].split("=", 1)[0]
+        if not any(probe in a for a in argv):
+            extra += rendered
+    return extra
+
+
+# A single argv string is bounded by the OS, and an oversized interactive SEED overflows it
+# with "OSError: [Errno 7] Argument list too long" before the child ever execs. Linux caps a
+# single argument at MAX_ARG_STRLEN (~128 KiB) — not total ARG_MAX; Windows caps the WHOLE
+# command line at 32,767 characters, which is why this is per-platform rather than one
+# "portable" number. A flat POSIX budget would leave the crash intact on a platform the
+# template supports (scripts/install.ps1, and the os.name == "nt" branches in act/worktree).
+_SEED_ARG_BUDGET = 24 * 1024 if os.name == "nt" else 96 * 1024
+
+#: Prefix for a spilled seed. Dot-prefixed and matched by the rendered `.gitignore`, so the
+#: file never shows up as untracked in the instance's tree — keep the two in step (a test
+#: asserts it).
+_SEED_SPILL_PREFIX = ".pdca-prompt-"
+
+
+def _seed_positional(prompt: str, workdir: Path) -> tuple[str, Path | None]:
+    """The interactive REPL seed, spilling an oversized prompt to a file (issue #313).
+
+    Interactive leaves inherit the TTY to open a REPL, so the prompt cannot ride **stdin**
+    the way a headless leaf's does — it goes as ``claude "<seed>"``. The Act leaf is what
+    trips the limit first: its prompt embeds the whole cross-cycle ACT INDEX, which grows
+    with every frozen cycle (observed at 151,653 bytes on a mature instance), so `pdca flow`
+    began dying the moment it auto-ran Act. Any interactive leaf can hit it — a large
+    planner or sign-off batch does the same.
+
+    Over budget, the prompt is written to a scratch file **inside ``workdir``** — the REPL's
+    cwd, so it reads it with no out-of-tree permission prompt — and the seed becomes a short
+    pointer. Under budget the prompt is passed inline, byte-for-byte as before.
+
+    Measured in BYTES, not characters: the OS limit is on the encoded argument, and a prompt
+    of mostly non-ASCII would otherwise pass a character-count check and still fail to exec.
+
+    Returns ``(seed, spill|None)``; the caller unlinks ``spill`` once the session ends.
+    """
+    if len(prompt.encode("utf-8")) <= _SEED_ARG_BUDGET:
+        return prompt, None
+    fh = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=workdir,
+        prefix=_SEED_SPILL_PREFIX, suffix=".md", delete=False)
+    with fh:
+        fh.write(prompt)
+    spill = Path(fh.name)
+    seed = (
+        "Your full instructions were too large to pass on the command line, so they "
+        f"were written to `{spill.name}` in your current directory. Read that file in "
+        "full now — it IS your prompt (task and context) — then carry it out."
+    )
+    return seed, spill
+
+
+# ----------------------------------------------------------------------------
+# Leaf memory bound (issue #420)
+#
+# The harness already bounds the other two resources a leaf can exhaust — wall clock
+# (`progress.run_with_heartbeat(timeout=…)`, #368) and disk (`[driver].sweep_worktrees`,
+# #297). Memory was the one left unbounded, and unbounded means UNATTRIBUTABLE: two
+# concurrent reviewer leaves wrote ~69 GB of cold build trees, systemd-oomd killed the
+# whole terminal cgroup for memory pressure, and the run's entire Check band vanished
+# with nothing in any gate log to say why — oomd kills the *cgroup*, not the offending
+# process, so the driver simply disappears. A bound puts each leaf in its own cgroup, so
+# the kernel reaps the offender INSIDE that scope: the leaf exits non-zero, `_invoke`
+# raises LeafError, and `_invoke_leaf_resilient` records it as that leaf's failure (#138).
+#
+# The facility is a systemd transient SCOPE: `--scope` execs the leaf as a direct child in
+# the caller's session, so it keeps the parent terminal (the interactive leaves are REPLs
+# the human types into) and its stdio, exit status and process group behave exactly as an
+# unwrapped spawn — unlike a `--pty`/service unit, which would take the tty away.
+_MEMORY_CAP_ARGV = ("systemd-run", "--user", "--scope", "--quiet", "--collect")
+
+# Property sets, richest first; the probe below picks the first this host accepts, so an
+# older systemd (or one without swap accounting) still gets a hard cap instead of nothing.
+#   MemoryMax      — the hard limit: the kernel OOM-kills inside the scope at this point.
+#   MemorySwapMax=0 — swapping does not relieve the pressure that killed the run, it just
+#                    converts an attributable kill into machine-wide thrash.
+#   ManagedOOMMemoryPressure=kill — give systemd-oomd a scope-sized target, so the leaf's
+#                    own cgroup is what dies under pressure rather than the session's.
+_MEMORY_CAP_PROPERTY_TIERS = (
+    ("MemoryMax={bound}", "MemorySwapMax=0", "ManagedOOMMemoryPressure=kill"),
+    ("MemoryMax={bound}", "MemorySwapMax=0"),
+    ("MemoryMax={bound}",),
+)
+
+#: Seconds allowed for the availability probe (a `systemd-run … true`). Bounded for the
+#: same reason the leaf is: a probe that hangs would hang the whole beat.
+_MEMORY_CAP_PROBE_TIMEOUT = 15
+
+#: The facility decision, resolved ONCE per bound per process: ``bound → wrapper argv``
+#: (``[]`` = this host cannot enforce it). Probing per spawn instead would pay a
+#: subprocess for every leaf and — worse — let a transient systemd hiccup unbound ONE
+#: leaf of a run while its siblings stayed capped, which is precisely the unattributable
+#: state this issue exists to remove: a run is either bounded or it is not, and it says
+#: which exactly once. A process is one `pdca` run, so this is per-run.
+_MEMORY_CAP_DECISION: dict[str, list[str]] = {}
+
+
+def _leaf_memory_bound(leaf: LeafConfig, cfg: Config | None) -> str:
+    """The configured bound for this leaf, or ``""`` for "unbounded" (#420).
+
+    ``[leaves.*].memory_max`` wins over ``[driver].leaf_memory_max`` (the per-leaf
+    escape hatch, mirroring "explicit argv always wins"), and an explicit ``"off"``
+    at either level means unbounded. Unset at both — the default — is ``""``: no
+    wrapping, no new process, byte-identical argv. ``cfg`` may be ``None``.
+    """
+    bound = (getattr(leaf, "memory_max", "") or "").strip()
+    if not bound:
+        bound = (getattr(cfg, "leaf_memory_max", "") or "").strip() if cfg else ""
+    return "" if bound.lower() == "off" else bound
+
+
+def _memory_cap_supported(argv: list[str]) -> bool:
+    """Does this host actually accept this wrapper? Probed by running it over ``true``.
+
+    A configured-but-unenforceable bound must be a documented NO-OP, never a hard
+    failure (the #213 treatment of a declared-but-missing host resource): the harness
+    also runs where there is no systemd/user manager at all, and a wrapper that fails
+    to exec would take down every leaf in the system rather than bound it. Probing the
+    exact argv — launcher plus properties — is the only honest availability answer:
+    `which systemd-run` says nothing about whether the user manager is reachable or the
+    properties are understood. Any failure, timeout or missing binary ⇒ unsupported.
+    """
+    try:
+        return subprocess.run([*argv, "true"], capture_output=True,
+                              timeout=_MEMORY_CAP_PROBE_TIMEOUT).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _memory_cap_prefix(leaf: LeafConfig, cfg: Config | None) -> list[str]:
+    """The wrapper argv that confines this leaf's spawn, or ``[]`` (#420).
+
+    ``[]`` — meaning "spawn exactly as today" — for both no-op cases: no bound
+    configured, and a bound this host cannot enforce. The host probe runs once per
+    bound per process (``_MEMORY_CAP_DECISION``), so the answer — and the note when it
+    is "cannot" — is the run's, not each spawn's.
+    """
+    bound = _leaf_memory_bound(leaf, cfg)
+    if not bound:
+        return []
+    if bound not in _MEMORY_CAP_DECISION:
+        _MEMORY_CAP_DECISION[bound] = _resolve_memory_cap(bound)
+    return list(_MEMORY_CAP_DECISION[bound])
+
+
+def _resolve_memory_cap(bound: str) -> list[str]:
+    """Probe this host for a wrapper that enforces ``bound``; ``[]`` if none does (#420)."""
+    for properties in _MEMORY_CAP_PROPERTY_TIERS:
+        argv = [*_MEMORY_CAP_ARGV]
+        for prop in properties:
+            argv += ["--property", prop.format(bound=bound)]
+        argv.append("--")
+        if _memory_cap_supported(argv):
+            return argv
+    print(f"leaves: memory bound {bound!r} is configured but this host cannot enforce it "
+          "(no usable `systemd-run --user --scope`) — running every leaf unbounded",
+          file=sys.stderr)
+    return []
+
+
+# ----------------------------------------------------------------------------
+# Leaf memory telemetry — the #420 bound's observability arm.
+#
+# The bound made an OOM kill ATTRIBUTABLE (the leaf's own scope dies, not the session),
+# but not EXPLAINABLE: the kernel's task table names bare comms ("python3" ×1187), the
+# stderr tail of a SIGKILLed leaf is empty, and by the time a human looks, the scope —
+# and with `--collect` its cgroup, including `memory.peak` — is gone. The measured
+# incident: a builder's test run forked ~1200 python3 processes in under a minute,
+# filled its 16G scope, and the only artifact was "died with SIGKILL".
+#
+# So: while a capped headless leaf runs, sample its scope cgroup on every heartbeat
+# tick (the harness is already awake then) and append one JSON line per sample to a
+# bundle-local `*.memory.jsonl` — memory used, process count, and the top command
+# lines by RSS, aggregated by argv so a fork storm reads as `1187× python3 -m
+# unittest …` rather than 1187 rows. On a failed leaf, a post-mortem — the last
+# sample plus the systemd/kernel journal's account of the scope's death — rides the
+# existing stderr-tail capture into `*.error.log`. Everything here is best-effort by
+# the `status`-probe contract: an observer can never break the run it observes.
+# ----------------------------------------------------------------------------
+
+#: How many distinct command lines a sample keeps (largest total RSS first). A storm
+#: is by definition one command repeated, so the interesting set is tiny.
+_MEMORY_TOP_COMMANDS = 5
+
+#: Journal lines kept in a post-mortem, per source (systemd's and the kernel's).
+_MEMORY_JOURNAL_LINES = 20
+
+
+def _memory_log_for(error_log: Path) -> Path | None:
+    """The telemetry file that pairs with a leaf's error log, or ``None``.
+
+    Derived, not configured: every resilient leaf already names a ``*.error.log``,
+    and the two files are two halves of the same post-mortem (what the leaf said /
+    what it consumed), so they must sit next to each other under the same stem.
+    """
+    if not error_log.name.endswith(".error.log"):
+        return None
+    stem = error_log.name[:-len(".error.log")]
+    return error_log.with_name(stem + ".memory.jsonl")
+
+
+def _fmt_bytes(n: int) -> str:
+    """`memory.current` for a heartbeat line: '512MB', '15.9GB'."""
+    if n >= 1024 ** 3:
+        return f"{n / 1024 ** 3:.1f}GB"
+    return f"{n // (1024 ** 2)}MB"
+
+
+def _scope_journal(unit: str, since: float) -> list[str]:
+    """systemd's and the kernel's account of a scope's death, best-effort.
+
+    Two sources because the story is split across them: the user manager logs the
+    verdict ("Failed with result 'oom-kill'", the memory peak), the kernel logs the
+    cause (which task invoked the OOM killer, the cgroup's anon/file breakdown).
+    Kernel lines are matched on the unit name OR the OOM phrases — the memcg kill
+    line ("Memory cgroup out of memory: Killed process …") does not carry the unit.
+    ``since`` (epoch seconds, the leaf's spawn) bounds both reads: without it, a
+    previous run's OOM kill matches the phrases and lands in THIS leaf's
+    post-mortem, which is precisely the misattribution telemetry exists to end.
+    Any failure — no journalctl, no permission, a hung journal — returns what was
+    gathered so far: this runs inside a post-mortem, where raising loses the log
+    that prompted it.
+    """
+    lines: list[str] = []
+    stamp = f"@{int(since)}"
+    try:
+        if unit:
+            out = subprocess.run(
+                ["journalctl", "--user", "-q", "--no-pager", "-u", unit,
+                 "--since", stamp, "-n", str(_MEMORY_JOURNAL_LINES)],
+                capture_output=True, text=True, timeout=10).stdout
+            lines += [f"systemd: {ln}" for ln in out.splitlines() if ln.strip()]
+        out = subprocess.run(
+            ["journalctl", "-q", "-k", "--no-pager", "--since", stamp, "-n", "2000"],
+            capture_output=True, text=True, timeout=10).stdout
+        oomish = ("oom", "out of memory")
+        kern = [ln for ln in out.splitlines()
+                if (unit and unit in ln) or any(s in ln.lower() for s in oomish)]
+        lines += [f"kernel: {ln}" for ln in kern[-_MEMORY_JOURNAL_LINES:]]
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the failure they explain
+        pass
+    return lines
+
+
+class _MemoryTelemetry:
+    """One capped headless leaf's scope observer; ``tick`` is the heartbeat hook.
+
+    Instantiated per spawn (attempts under `_invoke_leaf_resilient` each get their
+    own, appending to the same file with a fresh ``spawn`` record as the boundary).
+    ``proc_root`` / ``cgroup_root`` exist for the tests, which point them at a fake
+    tree — there is no hermetic way to fake a real scope.
+    """
+
+    def __init__(self, log: Path, bound: str, *,
+                 proc_root: Path = Path("/proc"),
+                 cgroup_root: Path = Path("/sys/fs/cgroup")) -> None:
+        self.log = log
+        self.bound = bound
+        self.proc_root = proc_root
+        self.cgroup_root = cgroup_root
+        self.cgroup: Path | None = None  # discovered lazily: the scope outlives no race
+        self.unit = ""
+        self.start = time.monotonic()
+        self.wall_start = time.time()  # bounds the post-mortem's journal harvest
+        self.last: dict | None = None
+        self._append({"event": "spawn", "bound": bound})
+
+    # -- the heartbeat hook ----------------------------------------------------------
+    def tick(self, pid: int) -> str:
+        """Sample the scope; return a short suffix for the tick line ('' = nothing).
+
+        Returns '' — and logs nothing — until the child is observed in a cgroup of
+        its OWN (the scope): sampling the cgroup it shares with the harness would
+        attribute the whole terminal session to the leaf, which is exactly the
+        unattributable state #420 removed.
+        """
+        try:
+            return self._sample(pid)
+        except Exception:  # noqa: BLE001 — the observer contract (progress.py `status`)
+            return ""
+
+    def _sample(self, pid: int) -> str:
+        if self.cgroup is None:
+            self._discover(pid)
+        if self.cgroup is None:
+            return ""
+        mem = int((self.cgroup / "memory.current").read_text())
+        try:
+            peak = int((self.cgroup / "memory.peak").read_text())
+        except (OSError, ValueError):  # memory.peak needs Linux ≥ 5.19
+            peak = None
+        pids = [int(p) for p in (self.cgroup / "cgroup.procs").read_text().split()]
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "elapsed": round(time.monotonic() - self.start, 1),
+            "unit": self.unit,
+            "memory": mem,
+            "peak": peak,
+            "procs": len(pids),
+            "top": self._top_commands(pids),
+        }
+        self.last = record
+        self._append(record)
+        return f"mem {_fmt_bytes(mem)}/{self.bound} · {len(pids)} procs"
+
+    def _discover(self, pid: int) -> None:
+        """Find the child's scope cgroup — but only once it differs from our own.
+
+        Right after the spawn, `systemd-run` has not necessarily entered its scope
+        yet, and an unwrapped child never leaves the harness's cgroup at all; both
+        look identical here and both must sample nothing.
+        """
+        own = (self.proc_root / "self" / "cgroup").read_text()
+        child = (self.proc_root / str(pid) / "cgroup").read_text()
+        if child == own:
+            return
+        for line in child.splitlines():  # cgroup v2: the single '0::/path' entry
+            if line.startswith("0::"):
+                path = line[len("0::"):].strip()
+                self.cgroup = self.cgroup_root / path.lstrip("/")
+                self.unit = self.cgroup.name
+                return
+
+    def _top_commands(self, pids: list[int]) -> list[dict]:
+        """The scope's population, aggregated by command line, largest RSS first.
+
+        The aggregation is the diagnosis: the kernel's own OOM table lists bare
+        comms one row per task, which for the measured incident read as 1187
+        indistinguishable "python3" rows — the *argv* (which test, which runner)
+        is the datum it lacked, and per-cmdline grouping is what turns a storm
+        into one legible line.
+        """
+        page = os.sysconf("SC_PAGE_SIZE")
+        groups: dict[str, list[int]] = {}  # cmd → [count, rss_bytes]
+        for p in pids:
+            try:
+                raw = (self.proc_root / str(p) / "cmdline").read_bytes()
+                # Collapse ALL whitespace, not just the NUL separators: an argv
+                # carrying newlines (`python3 -c "…\n…"`) would otherwise break the
+                # post-mortem's one-command-one-line layout.
+                cmd = " ".join(raw.replace(b"\0", b" ").decode(errors="replace").split())
+                if not cmd:  # kernel thread / zombie: fall back to the bare comm
+                    cmd = (self.proc_root / str(p) / "comm").read_text().strip()
+                rss = int((self.proc_root / str(p) / "statm").read_text().split()[1]) * page
+            except (OSError, ValueError, IndexError):
+                continue  # raced with an exit — the scope's population is a moving target
+            entry = groups.setdefault(cmd[:160], [0, 0])
+            entry[0] += 1
+            entry[1] += rss
+        top = sorted(groups.items(), key=lambda kv: kv[1][1], reverse=True)
+        return [{"cmd": cmd, "n": n, "rss": rss}
+                for cmd, (n, rss) in top[:_MEMORY_TOP_COMMANDS]]
+
+    # -- the failure path ------------------------------------------------------------
+    def post_mortem(self, rc: int) -> str:
+        """The death explained, for the `*.error.log` capture: last sample + journal.
+
+        Appended to the LeafError's ``output`` by `_invoke` so it rides the existing
+        #138/#279 capture into the bundle — the error log a human already opens on a
+        failed leaf is where the explanation belongs, not a fourth file.
+        """
+        try:
+            journal = _scope_journal(self.unit, self.wall_start)
+            self._append({"event": "exit", "rc": rc, "journal": journal})
+            lines = [f"----- memory telemetry (bound {self.bound}) -----"]
+            if self.last is not None:
+                age = round(time.monotonic() - self.start - self.last["elapsed"])
+                head = (f"last sample {age}s before exit: "
+                        f"{_fmt_bytes(self.last['memory'])} used")
+                if self.last.get("peak"):
+                    head += f" (peak {_fmt_bytes(self.last['peak'])})"
+                head += f", {self.last['procs']} processes in {self.unit or 'the scope'}"
+                lines.append(head)
+                lines += [f"  {t['n']}× {t['cmd']} — {_fmt_bytes(t['rss'])}"
+                          for t in self.last["top"]]
+            else:
+                lines.append("no sample captured (the leaf died before the first tick, "
+                             "or it never entered a scope)")
+            lines += [f"  {ln}" for ln in journal]
+            lines.append(f"samples: {self.log}")
+            return "\n" + "\n".join(lines) + "\n"
+        except Exception:  # noqa: BLE001 — never mask the failure being explained
+            return ""
+
+    def _append(self, record: dict) -> None:
+        try:
+            with self.log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass  # a read-only bundle costs the telemetry, never the leaf
+
+
+def _invoke(
+    leaf: LeafConfig,
+    workdir: Path,
+    prompt: str,
+    *,
+    label: str = "",
+    status=None,
+    stream_json: bool = False,
+    env: dict | None = None,
+    extra_argv: list[str] | None = None,
+    cfg: Config | None = None,
+    memory_log: Path | None = None,
+    on_event=None,
+) -> None:
+    """Run the leaf's configured command in ``workdir``, feeding it ``prompt``.
+
+    Interactive leaves get the prompt as a *seed positional* (``claude "<prompt>"``)
+    and inherit the parent terminal (a REPL); a non-zero exit (the human leaving
+    the session) is not fatal. Headless leaves get the prompt on **stdin**, not as
+    a trailing positional — a variadic option such as ``--allowedTools`` would
+    otherwise swallow the prompt arg (claude then errors "Input must be provided…").
+
+    ``label`` / ``status`` decorate the headless heartbeat (which leaf, and a live
+    snapshot of its work — see :func:`progress.bundle_activity`). ``stream_json``
+    (Tier 3) asks for the live tool-use stream when the leaf's family profile has
+    one (``profile.stream_argv``, e.g. claude's ``--output-format stream-json``);
+    families without a stream format ignore it. ``cfg`` enables the profile-driven
+    extras (role injection, model/effort mapping, ``[families.*]`` overrides);
+    ``None`` falls back to the built-in profile for the leaf's family.
+
+    Both branches spawn inside the leaf's configured memory bound when there is one
+    (``[driver].leaf_memory_max`` / ``[leaves.*].memory_max``, issue #420) — see
+    :func:`_memory_cap_prefix`. Unset (the default) or unenforceable on this host ⇒
+    the argv spawned here is byte-identical to what it was before that knob existed.
+
+    ``memory_log``, when given AND the bound is actually in force, turns on the
+    bound's observability arm for a headless leaf (:class:`_MemoryTelemetry`): scope
+    samples land there as JSONL, the heartbeat line grows a ``mem …/… · N procs``
+    suffix, and a failing leaf's :class:`LeafError` carries a memory post-mortem in
+    its ``output``. Unbounded or interactive spawns ignore it — without a scope
+    there is nothing attributable to sample.
+
+    ``on_event`` is handed to :func:`progress.run_with_heartbeat` (issue #526): it sees
+    every decoded event of the leaf's stream, a successful run's included — the only
+    view a caller gets of what happened inside a run that exited 0. Ignored when the
+    run has no stream (``stream_json`` off, a stream-less family, an interactive leaf).
+    """
+    profile = families.resolve(leaf.family, cfg.families if cfg else None)
+    role_argv, prompt_prefix = _role_injection(cfg, leaf, profile)
+    argv = list(leaf.argv) + role_argv
+    argv += _mapped_argv(leaf, profile, argv)
+    argv += list(extra_argv or [])
+    # Confine the spawn to its configured memory bound (#420). One decision for BOTH
+    # branches below — a bound that covered only the headless leaves would be a lie for
+    # half of them. `[]` (unset, or a host that cannot enforce it) leaves argv untouched,
+    # so the default spawn is byte-identical to before. Prepended here, ahead of the
+    # per-branch tails (the stream flags, the interactive seed): everything after the
+    # wrapper's `--` is the leaf's own command line, in its original order.
+    cap = _memory_cap_prefix(leaf, cfg)
+    argv = cap + argv
+    prompt = prompt_prefix + prompt
+    run_env = {**os.environ, **env} if env else None
+    if leaf.interactive:
+        # The seed may be spilled to a file when it would blow the OS single-argument
+        # limit (#313). `finally` so a non-zero exit or a raising spawn still cleans up;
+        # a SIGKILLed session can still orphan one, which is why the name is gitignored.
+        seed, spill = _seed_positional(prompt, workdir)
+        # End-of-options separator between the instance's argv and the seed (#396):
+        # bare, a trailing optional-value flag (claude's `--remote-control [name]`)
+        # eats the whole seed as its value — RC then fails to start and the REPL
+        # opens unseeded. The separator makes the #313 seed contract argv-independent
+        # (POSIX guideline 10: after `--` everything is positional). Families without
+        # a verified separator keep the bare-positional spawn, byte-identical.
+        sep = [profile.seed_separator] if profile.seed_separator else []
+        try:
+            subprocess.run(argv + sep + [seed], cwd=workdir, env=run_env)
+        finally:
+            if spill is not None:
+                spill.unlink(missing_ok=True)
+        return
+    # Headless: feed the prompt on stdin (a trailing positional would be swallowed
+    # by a variadic --allowedTools) and tick a heartbeat, since `claude -p` prints
+    # nothing until it finishes (minutes) and would otherwise look hung.
+    # progress.py's stream reader dispatches on the family's stream_format; a family
+    # declaring a format it doesn't recognize runs stream-less (heartbeat Tiers 1+2).
+    # tee_stderr regardless: the stream path already tees, and a stream-LESS family
+    # (generic, gemini) otherwise captures nothing at all, so its `*.error.log` reads
+    # "(no output captured)" — a post-mortem artifact that explains nothing (#286 review).
+    use_stream = (stream_json and bool(profile.stream_argv)
+                  and profile.stream_format in progress.STREAM_FORMATS)
+    if use_stream:
+        argv += list(profile.stream_argv)
+    # Observe the scope only when there IS one (`cap`): telemetry against an unwrapped
+    # spawn would sample the cgroup the leaf shares with the harness — the whole
+    # session's numbers attributed to one leaf, worse than no numbers.
+    telemetry = (_MemoryTelemetry(memory_log, _leaf_memory_bound(leaf, cfg))
+                 if cap and memory_log is not None else None)
+    rc, output, produced = progress.run_with_heartbeat(
+        argv, cwd=workdir, input_text=prompt, label=label, status=status,
+        stream_json=use_stream, tee_stderr=True, stream_format=profile.stream_format,
+        env=run_env, telemetry=telemetry.tick if telemetry else None, on_event=on_event)
+    if rc != 0:
+        if telemetry is not None:
+            # The death explained next to the death reported: the post-mortem rides
+            # `output` into the same `*.error.log` the stderr tail lands in.
+            output = (output or "") + telemetry.post_mortem(rc)
+        # Only the stream path says how the leaf died — whether a session started, whether
+        # it ended on the vendor's own transient report, and whether its usage limit was
+        # refusing requests (#539). Without it (a stream-less family) we can tell none of
+        # that from a substantive failure, so report produced=True → not transient, not
+        # retried — preserving the prior immediate-placeholder behavior for non-stream
+        # leaves.
+        raise LeafError(rc, argv, output=output, produced=produced or not use_stream)
+
+
+# Two additions for the Do builder (#537), documented here rather than in the docstring
+# below (sibling #533 owns that prose). Both leave a call site that does not use them
+# exactly as it was:
+#   * ``prompt`` may be a callable of the attempt number (1, 2, …), asked for attempt N's
+#     prompt immediately before attempt N is spawned. A retried leaf is re-invoked over
+#     whatever its dead predecessor left, and only the caller knows what that is and how
+#     its leaf should read it. A plain string is sent unchanged on every attempt.
+#   * When the settled record cannot be written, the write's OSError is still raised, now
+#     FROM the leaf's own final failure (``__cause__``), so a caller whose contract is that
+#     the leaf's failure reaches the flow (Do, #286) can still re-raise it.
+def _invoke_leaf_resilient(
+    leaf: LeafConfig,
+    workdir: Path,
+    prompt: str | collections.abc.Callable[[int], str],
+    *,
+    error_log: Path,
+    attempts: int = 3,
+    backoff: float = 4.0,
+    harvest: _LeafHarvest | None = None,
+    **kw,
+) -> Exception | None:
+    """Run a headless reviewer/advisory leaf with bounded retry + error capture (#138).
+
+    A transient-infra death (:attr:`LeafError.transient`) is retried with exponential
+    backoff: a non-zero exit before the leaf emitted any work, where no report says why (a
+    rate limit, a 5xx or a network blip at invocation), or one whose main session ended on
+    the CLI's own report of a cause the vendor marks transient (a lost connection, an
+    overload or 5xx, a passing rate-limit rejection) however much work came first — not a
+    reviewer that read the diff and couldn't decide. Every other failure is substantive and
+    not retried: a leaf that worked and then failed on its own account, one a **signal**
+    killed (#510), one whose stream says the account's usage limit is refusing requests (a
+    spent subscription window, which refuses every attempt until it resets), or a
+    non-LeafError (e.g. command not found). A retry is a fresh re-invoke of the whole leaf,
+    not a resume of its session. Each failed attempt's captured stderr
+    tail is written to ``error_log`` AS IT HAPPENS (#540), so the bundle carries
+    recoverable error text, not just an exit code, from the moment there is any — and a
+    run killed inside the retry loop leaves a post-mortem instead of nothing at all. The
+    record is settled (:func:`state.settled_record`) only when the attempts are spent;
+    until then it carries no settlement marker, so every reader treats it exactly as it
+    treats an absent log and the leaf is re-run rather than retired. Returns ``None`` on
+    success, else the final exception (a :class:`LeafError` exposes ``.transient``).
+
+    The unfinished state's whole lifetime is inside this function: the loop ends either by
+    failing, which settles the records, or by succeeding, which discards them — so no
+    caller ever has to know about it.
+
+    ``harvest`` (#541) is the :class:`_LeafHarvest` that owns the artifact path the leaf
+    writes to. Every attempt runs in the SAME workdir, so a file a dying attempt left there
+    is still sitting at that path when the next attempt starts — and the caller's
+    ``if produced.exists()`` could not tell whose work it was. The owner is therefore told
+    of each death as it happens (``withdraw``): it takes the dead attempt's file OFF the
+    path and returns it quoted, as part of that attempt's record, so nothing is destroyed
+    and nothing can be re-attributed. Passing no owner leaves this function byte-identical
+    to #540 — a caller with no artifact of its own (a direct test drive) has nothing to own.
+
+    Every attempt also runs under memory telemetry when its spawn is memory-capped:
+    the ``*.memory.jsonl`` twin of ``error_log`` (`_memory_log_for`), cleared here
+    under the same staleness rule, each attempt's samples separated by its ``spawn``
+    record."""
+    error_log.unlink(missing_ok=True)  # clear any stale tail from a prior cycle run
+    memory_log = _memory_log_for(error_log)
+    if memory_log is not None:
+        memory_log.unlink(missing_ok=True)
+        kw.setdefault("memory_log", memory_log)
+    records: list[str] = []
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _invoke(leaf, workdir, prompt(attempt) if callable(prompt) else prompt, **kw)
+            # Success — leave no error log behind, as before (#138). Now that a failed
+            # attempt flushes its record as it happens (#540), "no error log" has to be
+            # RESTORED on the retry that recovers: an unfinished record left beside a
+            # produced artifact would describe a leaf that has since succeeded. Suppressed
+            # like the flush itself — a leaf that worked must not be turned into a failure
+            # by the cleanup of its own post-mortem.
+            #
+            # The dead attempts' account is handed to the artifact's owner FIRST (#541):
+            # the log is about to go, and the owner is the one that knows whether the
+            # operator is about to be told "no artifact was produced" — the one case in
+            # which that account (including what a dead attempt left at the artifact path)
+            # must go back into the bundle rather than vanish with the log.
+            if harvest is not None:
+                harvest.leaf_succeeded("".join(records))
+            with contextlib.suppress(OSError):
+                error_log.unlink(missing_ok=True)
+            return None
+        except Exception as exc:  # noqa: BLE001 — a failed leaf must never crash the cycle
+            last = exc
+            records.append(_format_leaf_attempt(exc, attempt))
+            # …and whatever this attempt left at the artifact path, taken off it and quoted
+            # into the same record (#541) — BEFORE the stop rule below, so the last attempt's
+            # residue is preserved exactly like every earlier one's.
+            if harvest is not None:
+                records.append(harvest.withdraw(attempt))
+            transient = getattr(exc, "transient", False)
+            if not transient or attempt == attempts:
+                break
+            # This attempt's account, on disk BEFORE the next one starts (#540) and
+            # UNSETTLED — the only write used to be the one after the loop, so a run killed
+            # mid-retry lost every attempt's account and a leaf observing the bundle during
+            # attempt 2 found nothing about attempt 1.
+            _flush_attempt_records(error_log, records)
+            delay = backoff * (2 ** (attempt - 1))
+            print(f"leaves: {workdir.name} — leaf exited {getattr(exc, 'returncode', '?')} "
+                  "on transient infra (before emitting any work, or on its own report of a "
+                  f"transient API error); retry {attempt}/{attempts - 1} in {delay:.0f}s",
+                  file=sys.stderr)
+            time.sleep(delay)
+    # The attempts are spent: the same records, now SETTLED — which is what makes the log
+    # read as "the leaf ran and FAILED" (state.leaf_ran_and_failed). Raises exactly as the
+    # single write it replaces did: a bundle that cannot hold its own error log is not a
+    # failure this wrapper may swallow.
+    try:
+        _replace_record(error_log, state.settled_record("".join(records)))
+    except OSError as exc:
+        raise exc from last  # the same OSError; the leaf's failure rides along (#537)
+    return last
+
+
+# What a preserved account ends with when the leaf itself went on to exit 0 (#541). Prose
+# for whoever opens the file, never a discriminator: it carries NO settlement marker, so
+# `state.leaf_ran_and_failed` reads False and every reader treats the log exactly as it
+# treats an absent one — the leaf may be re-run, which is precisely the remedy here.
+_WITHDRAWN_TRAILER = ("----- the leaf then exited 0, but nothing of ITS OWN could be filed; "
+                      "the records above are the attempts that died before it -----")
+
+# How much of a withdrawn residue is QUOTED into the bundle's error log: this many reads
+# from each end, each bounded to `_RESIDUE_READ` bytes, with an elision line between them.
+# A residue is a whole review artifact and `*.error.log` is a TRACKED bundle file, so
+# quoting it whole put a measured 9.6 MB into project history for one 3.2 MB artifact that
+# died transiently three times (#541 review). Bounded exactly like the channel it rides
+# beside — `progress.py`'s `err_tail = deque(maxlen=200)`, the same attempt's stderr tail.
+# Head AND tail, because a truncated verdict says the most at both ends: what it was
+# reviewing, and where it was cut off. The read is bounded too, not just the line count: an
+# artifact need not contain a single newline, and one 3 MB "line" is one 3 MB string.
+_RESIDUE_LINES = 100
+_RESIDUE_READ = 1000
+
+
+class _Residue(NamedTuple):
+    """A file a dead attempt left at the artifact path, as the harness last saw it (#541).
+
+    ``attempt`` is the one whose record already quoted it, so a LATER withdrawal that finds
+    the very same file can say "nothing new" instead of quoting it again under its own name.
+    ``digest`` covers every byte, or is ``None`` when the residue could not be read — which
+    no longer condemns the path, because the identity it is filed under settles ownership
+    on its own (:func:`_residue_identity`).
+    """
+
+    attempt: int
+    digest: str | None
+
+
+class _LeafHarvest:
+    """The ONE owner of the artifact path a retried leaf writes to (#541).
+
+    All three harvest sites — the Check reviewer, a Check advisory leaf, a plan advisory
+    leaf — used to end with the same hand-copied test: ``if produced.exists(): copy2(...)``,
+    else a placeholder. That test knows nothing about WHICH attempt wrote the file, and every
+    attempt runs in the same sandbox — so a truncated verdict left behind by an attempt that
+    then died transiently was copied out as the output of the attempt that exited 0
+    afterwards. The engine's rule is the opposite one: no evidence must never be
+    filed as a verdict (``engine/README.md`` §The two gate shapes that matter — "a gate
+    never turns 'no evidence' into a verdict"). Copying it in three places is what let
+    a fix land at two sites and leave the third wrong, so the mechanism lives here once and
+    the sites hold only what genuinely differs — the paths and their own §6 prose.
+
+    Two moments, both driven by :func:`_invoke_leaf_resilient`:
+
+    * :meth:`withdraw`, as each attempt dies — the file that attempt left is taken OFF the
+      path and returned quoted, so it lands in the bundle's ``*.error.log`` as that
+      attempt's account instead of being silently deleted (a real verdict must not be
+      destroyed while the operator is told none was produced) and can never be read as a
+      later attempt's work. If it cannot be withdrawn, the path is UN-OWNED from then on;
+      that state is carried forward rather than ending the run — the leaf keeps every
+      attempt the shipped stop rule gives it, and the refusal is paid at the harvest.
+    * :meth:`run`, around the whole loop — on a failure the site's placeholder, on success
+      the harvest itself: the live attempt's own file, or nothing at all. An un-owned path
+      is settled by IDENTITY there (:meth:`_live_attempt_took_the_path`), not refused on
+      sight: a residue that could not be unlinked can still have been overwritten by the
+      attempt that exited 0, and that file is its verdict.
+
+    Every residue it could not remove is remembered by :func:`_residue_identity`, which is
+    what makes both of those exact rather than heuristic: the same file is recognised on a
+    later attempt's death (quoted once, not once per attempt) and at the harvest (refused),
+    while a file that has been written since is recognised as the live attempt's work
+    whether or not its bytes differ.
+    """
+
+    def __init__(self, *, produced: Path, dest: Path,
+                 unavailable: Callable[[str, str], None],
+                 empty_reason: str, failed_reason: str = "leaf failed",
+                 explain: Callable[[Exception | None], tuple[str, str] | None]
+                 | None = None) -> None:
+        self.produced = produced          # where the leaf writes, inside its sandbox
+        self.dest = dest                  # where a HARVESTED artifact lands, in the bundle
+        self._unavailable = unavailable   # the site's §6 placeholder: (reason, failure)
+        self._empty_reason = empty_reason
+        self._failed_reason = failed_reason
+        # A site's own, more specific account of a run that files nothing — given the
+        # final exception, or None when the live attempt exited 0 and wrote nothing — as
+        # ``(reason, failure)``, or None to keep the generic one. Only the plan reviewer
+        # has one (#526: a vendor sandbox that could not start). It never decides WHETHER
+        # an artifact is filed, only how a placeholder explains why none was.
+        self._explain = explain
+        self._unowned: str | None = None  # why the path can no longer be attributed
+        # What was left ON the path and could not be withdrawn, by filesystem identity.
+        self._residues: dict[tuple[int, ...], _Residue] = {}
+        self._unidentified = False        # …and whether one could not even be `stat`-ed
+        self._account = ""                # the dead attempts' records, once the leaf exits 0
+        self._error_log: Path | None = None
+
+    def run(self, leaf: LeafConfig, workdir: Path, prompt: str, *,
+            error_log: Path, **kw) -> bool:
+        """Run the leaf under the retry loop, then file ONLY the live attempt's artifact.
+
+        Never raises for a leaf that merely failed: every path here ends in either a
+        harvested artifact or the site's §6 placeholder, exactly as the three sites did
+        by hand. Returns whether it filed the live attempt's artifact — False means the
+        placeholder is what the bundle holds."""
+        self._error_log = error_log
+        err = _invoke_leaf_resilient(leaf, workdir, prompt, error_log=error_log,
+                                     harvest=self, **kw)
+        if err is not None:
+            self._unavailable(*(self._explained(err)
+                                or (f"{self._failed_reason}: {err}", _failure_class(err))))
+            return False
+        # The live attempt exited 0. Anything at the path is ITS work — each dead attempt's
+        # file was withdrawn as that attempt died — UNLESS a withdrawal was refused and what
+        # is there is still that dead attempt's file, which nothing may be filed from.
+        if not self.produced.exists():
+            self._degrade(*(self._explained(None)
+                            or (self._empty_reason, _FAIL_SUBSTANTIVE)))
+        elif self._unowned is not None and not self._live_attempt_took_the_path():
+            self._degrade(self._unowned, _FAIL_UNOWNED)
+        else:
+            shutil.copy2(self.produced, self.dest)
+            return True
+        return False
+
+    def _explained(self, err: Exception | None) -> tuple[str, str] | None:
+        """The site's own account of a run that filed nothing, when it has one."""
+        return self._explain(err) if self._explain is not None else None
+
+    def withdraw(self, attempt: int) -> str:
+        """Take the just-dead ``attempt``'s artifact off the path, quoted into its record.
+
+        Returns that attempt's record block for the retry loop's account — ``""`` when the
+        attempt left nothing, which is the ordinary shape. The text is embedded through
+        :func:`state.neutralize_leaf_text` for the same reason the stderr tail is (#540):
+        it is the leaf's own text landing in the harness's account of the leaf's own run.
+
+        A residue an earlier withdrawal already quoted and could NOT remove is recognised
+        before it is read (#541 review). It is still sitting at the path when the next
+        attempt dies, and that attempt never wrote it: quoting it again would file the same
+        text under a second attempt's name — "no notion of which attempt wrote it", one
+        level down, inside the fix for it — and would re-read and re-digest a whole artifact
+        once per attempt.
+        """
+        try:
+            ident = _residue_identity(self.produced)
+        except FileNotFoundError:
+            return ""                       # the ordinary shape: it wrote nothing
+        except OSError as exc:              # something is there that cannot even be named
+            self._disown(f"could not be examined ({exc})")
+            return self._record(attempt, f"(the residue could not be examined) {exc}")
+        known = self._residues.get(ident)
+        if known is not None:
+            return self._unchanged(attempt, known.attempt)
+        try:
+            text, digest = _read_residue(self.produced)
+        except FileNotFoundError:
+            return ""                       # it went away between the stat and the read
+        except OSError as exc:              # there IS something there, and it is unreadable
+            # NOT unlinked: what could not be quoted must not be destroyed either — that is
+            # the same loss, with the account missing too. Its identity is recorded, so an
+            # attempt that writes over it is still recognisable as having done so.
+            self._disown(f"could not be read ({exc})", ident, _Residue(attempt, None))
+            return self._record(attempt, f"(the residue could not be read) {exc}")
+        try:
+            self.produced.unlink()
+        except OSError as exc:
+            # Carry the un-owned state forward instead of ending the run (the residue is
+            # already quoted by now): the retry contract is the shipped stop rule's alone,
+            # and the harvest below refuses this path rather than filing a file it cannot
+            # attribute. A bundle whose writes are failing loses no attempt over it.
+            self._disown(f"could not be removed ({exc})", ident, _Residue(attempt, digest))
+        return self._record(attempt, state.neutralize_leaf_text(text))
+
+    def leaf_succeeded(self, account: str) -> None:
+        """Keep the dead attempts' records: the successful attempt is about to clear the
+        error log (#540), and they are needed back only if the harvest files nothing."""
+        self._account = account
+
+    def _live_attempt_took_the_path(self) -> bool:
+        """Is the file at the path provably NOT one of the residues we failed to withdraw?
+
+        ``unlink()`` needs write permission on the DIRECTORY; ``open(path, "w")`` needs it
+        only on the FILE — so a residue this harness could not take off the path can still
+        be overwritten by the attempt that goes on to exit 0, and what is there is then that
+        attempt's own complete verdict. Refusing THAT would destroy a live verdict in order
+        to protect against a dead one, in a bundle that then says no artifact was produced:
+        the same destruction this class exists to prevent, aimed the other way.
+
+        Settled by IDENTITY (#541 review), because content cannot settle it in either
+        direction: a deterministic leaf that re-writes the same verdict on its next attempt
+        produces bytes IDENTICAL to the residue, and a residue that could never be READ has
+        no bytes to compare at all — both were refused, and both were live verdicts. Any
+        write moves ``st_mtime_ns``; an atomic ``os.replace`` moves ``st_ino`` too. The
+        digest is then a second chance in the other direction, for a filesystem whose
+        timestamps are too coarse to have moved: the same identity carrying DIFFERENT bytes
+        is still a rewrite. Only "the same file, unchanged" is refused.
+
+        Conservative in the two cases it cannot settle: a residue that could not even be
+        ``stat``-ed was never filed under an identity, and a path that cannot be examined
+        NOW cannot be attributed either — both stay un-owned whatever is on them.
+        """
+        if self._unidentified:
+            return False
+        try:
+            ident = _residue_identity(self.produced)
+        except OSError:
+            return False
+        known = self._residues.get(ident)
+        if known is None:
+            return True    # written since the last withdrawal, and only the leaf writes here
+        now = _artifact_digest(self.produced)
+        return known.digest is not None and now is not None and now != known.digest
+
+    def _degrade(self, reason: str, failure: str) -> None:
+        """No artifact filed: preserve the dead attempts' account, then the §6 placeholder."""
+        self._preserve()
+        self._unavailable(reason, failure)
+
+    def _preserve(self) -> None:
+        """Put the dead attempts' account — including whatever they left at the artifact
+        path — back in the bundle's ``*.error.log``.
+
+        Only ever on the degrade path, and only for a run that HAD dead attempts: the
+        operator is about to be told no artifact was produced, so the one text that could
+        have been one must not be the thing this cycle deleted. A leaf whose own artifact
+        IS filed still leaves no error log behind (#540) — nothing to explain there.
+
+        Best-effort, like the mid-retry flush it mirrors: a bundle that cannot take the
+        write still gets its placeholder, since failing here would turn a leaf that merely
+        produced nothing into a crashed Check beat."""
+        if not self._account or self._error_log is None:
+            return
+        try:
+            _replace_record(self._error_log, self._account + _WITHDRAWN_TRAILER + "\n")
+        except OSError as exc:
+            print(f"leaves: could not preserve the dead attempts' account in "
+                  f"{self._error_log.name} ({exc}); the placeholder below is all that is "
+                  "left of them", file=sys.stderr)
+
+    def _disown(self, why: str, ident: tuple[int, ...] | None = None,
+                residue: _Residue | None = None) -> None:
+        """Mark the path un-ownable, remembering WHICH file is on it.
+
+        Nothing may be filed from it unless a later attempt provably wrote there, which is
+        what ``ident`` is kept for — including for a residue that could not be READ, whose
+        identity is knowable even when its bytes are not. Only a residue that could not be
+        ``stat``-ed at all leaves nothing to settle by.
+        """
+        self._unowned = (
+            f"the leaf exited 0, but {self.produced.name} could not be attributed to it: "
+            f"a dead attempt's file was still there and {why}")
+        if ident is None or residue is None:
+            self._unidentified = True
+        else:
+            self._residues[ident] = residue
+
+    def _record(self, attempt: int, body: str) -> str:
+        return (f"----- attempt {attempt} — what it left at {self.produced.name} "
+                f"(withdrawn: it is NOT a later attempt's work) -----\n{body}\n\n")
+
+    def _unchanged(self, attempt: int, owner: int) -> str:
+        """``attempt`` left nothing new — the file on the path is still the one attempt
+        ``owner``'s record quoted, and could not be removed then either."""
+        return (f"----- attempt {attempt} — nothing new at {self.produced.name}: attempt "
+                f"{owner}'s residue is still there, un-withdrawn and quoted above "
+                f"-----\n\n")
+
+
+def _read_residue(path: Path) -> tuple[str, str]:
+    """What a dead attempt left at ``path``: BOUNDED text to quote, and a digest of ALL of it.
+
+    Two jobs, one read, because the two answers must describe the same bytes. The text goes
+    into a tracked bundle file, so it is capped head/tail with an elision line
+    (:data:`_RESIDUE_LINES`); the digest covers every byte, so a later attempt that
+    overwrites this residue IN PLACE is still recognisable as having done so
+    (:meth:`_LeafHarvest._live_attempt_took_the_path`) even on a filesystem whose
+    timestamps are too coarse to have moved, and even when the quote elided most of it.
+
+    Raises ``OSError`` — ``FileNotFoundError`` when the attempt left nothing at all; the
+    caller decides what an unreadable residue means.
+    """
+    digest = hashlib.sha256()
+    head: list[str] = []
+    tail: deque[str] = deque(maxlen=_RESIDUE_LINES)
+    elided = 0
+    with path.open("rb") as fh:
+        # readline(limit), not iteration: consecutive calls still cover every byte (so the
+        # digest is of the whole file), but no single read — hence no single line — can be
+        # larger than the bound.
+        while chunk := fh.readline(_RESIDUE_READ):
+            digest.update(chunk)
+            line = chunk.decode("utf-8", "replace").rstrip("\n")
+            if len(head) < _RESIDUE_LINES:
+                head.append(line)
+                continue
+            if len(tail) == _RESIDUE_LINES:
+                elided += 1
+            tail.append(line)
+    middle = ([f"----- … {elided} line(s) elided: the residue is quoted head and tail only, "
+               "bounded like the stderr tail beside it -----"] if elided else [])
+    return "\n".join(head + middle + list(tail)), digest.hexdigest()
+
+
+def _residue_identity(path: Path) -> tuple[int, ...]:
+    """WHICH file is at ``path`` right now, as the filesystem sees it (#541 review).
+
+    The one question :class:`_LeafHarvest` has to answer about a residue it could not
+    remove — "is this still it?" — and content cannot answer it. A leaf that re-writes the
+    same verdict deterministically leaves bytes identical to the residue's, and a residue
+    that could not be READ has no bytes to compare at all; both were read as "unchanged"
+    and cost a live verdict. ``st_mtime_ns`` moves on any write, ``st_ino`` on an atomic
+    ``os.replace``, and both are knowable for a file this process cannot open. ``st_dev``
+    (an inode number is only unique within a filesystem), ``st_size`` and ``st_ctime_ns``
+    cost nothing and narrow the one remaining coincidence — an in-place rewrite a
+    coarse-granularity clock did not separate — which the digest then covers.
+
+    Raises ``OSError`` — ``FileNotFoundError`` when nothing is there at all.
+    """
+    st = path.stat()
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _artifact_digest(path: Path) -> str | None:
+    """A digest of everything at ``path``, or ``None`` when nothing readable is there.
+
+    It answers exactly one question (#541 review): is this still the file a dead attempt
+    left, or has the attempt that exited 0 written over it?
+    """
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            while chunk := fh.read(65536):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _flush_attempt_records(error_log: Path, records: list[str]) -> None:
+    """Persist the attempts so far as an UNFINISHED record (#540) — best-effort.
+
+    Best-effort by decision, not by omission: a flush that fails (a read-only bundle dir,
+    ENOSPC) must NOT end a run the shipped stop rule would have kept going — attempt count,
+    the transient rule and the backoff schedule are unchanged by this write. The records
+    stay in hand, so the loop's final write still persists them: strictly no worse than
+    before, when nothing reached disk until then.
+    """
+    try:
+        _replace_record(error_log, state.unfinished_record("".join(records)))
+    except OSError as exc:
+        print(f"leaves: could not flush the attempt record to {error_log.name} ({exc}); "
+              "it will be written when the retry loop ends", file=sys.stderr)
+
+
+def _replace_record(error_log: Path, text: str) -> None:
+    """Put ``text`` in ``error_log`` in ONE step — a sibling temp file, then ``os.replace``.
+
+    ``Path.write_text`` is open(O_TRUNC) → write → close, so a write that dies part-way
+    (ENOSPC, RLIMIT_FSIZE, a killed run) leaves the log 0-byte or truncated. For these
+    records a truncated file is not merely incomplete, it says something else: it has lost
+    whatever the complete record said about the leaf, and the previous complete record it
+    overwrote is gone with it — so the mid-retry post-mortem this function exists to
+    guarantee would be destroyed by the very next flush that fails. Replacing the file
+    whole means a failed write leaves the last good record exactly where it was, and a
+    reader never sees a half-written one. The temp is removed on failure so a partial
+    sibling is never left in the bundle.
+    """
+    tmp = error_log.with_name(f".{error_log.name}.partial")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, error_log)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+def _format_leaf_attempt(exc: Exception, attempt: int) -> str:
+    """One attempt's record for the error log: the captured stderr tail, or the
+    exception text when nothing was captured (e.g. command not found).
+
+    The tail is embedded through :func:`state.neutralize_leaf_text` (#540): it is the
+    leaf's own text landing in the harness's account of the leaf's own run, so a
+    marker-shaped line out of the leaf's mouth must not be able to say "this leaf spent
+    its attempts" on the harness's behalf."""
+    tail = (getattr(exc, "output", "") or "").strip()
+    rc = getattr(exc, "returncode", "?")
+    body = (state.neutralize_leaf_text(tail) if tail
+            else f"(no output captured) {type(exc).__name__}: {exc}")
+    return f"----- attempt {attempt} — exit {rc} -----\n{body}\n\n"
+
+
+# ----------------------------------------------------------------------------
+# Workspace admission for the INTERACTIVE leaves (issue #494).
+#
+# Every directory the harness INSTRUCTS a leaf to read must be admitted to that leaf's
+# workspace BY THE HARNESS, through the family's grounding flag. The headless half
+# already does it — ``_do_build_command`` for the builder's worktree and bundle dir,
+# ``_run_review_sandboxed`` for the reviewer's resolved target, both advisories — but the
+# six interactive spawns (Plan single/batch, sign-off single/batch, Act, publish) passed no
+# ``extra_argv`` at all, while their prompts point straight at the target checkout
+# (``_plan_prompt``'s citation line, planner.md.jinja, publisher.md.jinja). Their cwd is
+# ``cfg.root``, so that checkout sat OUTSIDE the workspace: the human was asked to
+# approve the same out-of-workspace read every session, and could not make the approval
+# stick — a hand-granted rule lives in the operator's untracked
+# ``.claude/settings.local.json``, which a lane worktree never materializes and
+# ``--setting-sources project`` (families.py:100-102) drops by design. The spawn's argv
+# is the durable channel, and the one the headless half already uses.
+#
+# The set is DERIVED, never guessed, and both edges of the confinement doctrine bind:
+# under-admission asks the human for a decision that cannot take effect, on the one band
+# that cannot be retried unattended; over-admission hands a leaf reach the configuration
+# never granted (:func:`_plan_fallback_target` refuses exactly that). So there are TWO
+# grants, and which one a call site may use is a property of its ROLE:
+#
+#   :func:`_bundle_grant` — sign-off (single/batch), Act, publish. Strictly the
+#       checkouts the bundles THIS session is about resolve to. A session that HAS a
+#       bundle whose checkout does not resolve admits nothing; it must never widen to
+#       the instance's other, unrelated targets — that is over-admission for a session
+#       that already knows what it is about.
+#   :func:`_plan_grant`   — Plan (single/batch) ONLY. The same resolution, falling back
+#       to the instance's KNOWN targets when nothing resolves — which pre-brief is the
+#       normal case, and is the whole of the question "what may the planner read before
+#       a brief exists to name a repo".
+# ----------------------------------------------------------------------------
+def _primary_checkout(d: Path, cfg: Config) -> Path | None:
+    """The primary target checkout bundle ``d``'s brief names, or ``None``.
+
+    Resolved the way :func:`_plan_fallback_target` resolves it (``publish._resolve_target``
+    → ``publish._checkout_path``, guarded) — deliberately NOT :func:`_reviewer_target`,
+    which the interactive band must not reuse: it prefers ``worktree.path()``, and these
+    leaves run SERIALLY, so ``lane.current()`` is ``None`` (lane.py:26-28) and
+    ``worktree._wt_dir`` (worktree.py:107-112) names the *unsuffixed* ``<name>.pdca-wt``
+    — a harness-owned tree left at whatever commit its last user built, owned by no
+    bundle, and not the checkout the human has open in front of them.
+    :func:`_reviewer_target` also ``git fetch``es for a grounding freshness these leaves
+    do not need, against the human's own checkout, on every spawn.
+
+    Best-effort, like every other grounding resolution here: no brief yet, an
+    unresolvable target field, or a checkout that is not a directory on this disk ⇒
+    ``None``, contributing nothing. The grant is never faked or guessed.
+    """
+    from . import publish  # lazy: publish imports leaves, avoid an import cycle
+    try:
+        repo_spec, _base, _slug = publish._resolve_target(d)
+        if not repo_spec:
+            return None
+        p = publish._checkout_path(cfg, repo_spec)
+    except Exception:  # noqa: BLE001 — admission is best-effort, never fatal
+        return None
+    return p if p.is_dir() else None
+
+
+def _bundle_targets(bundles: list[Path], cfg: Config) -> list[Path]:
+    """The primary checkouts ``bundles`` resolve to: deduped, in encounter order,
+    existing directories only. The whole admission set for a session that HAS bundles."""
+    dirs: list[Path] = []
+    for d in bundles:
+        p = _primary_checkout(d, cfg)
+        if p is not None and p not in dirs:
+            dirs.append(p)
+    return dirs
+
+
+def _known_targets(cfg: Config) -> list[Path]:
+    """The instance's KNOWN target checkouts — Plan's fallback, and Plan's alone.
+
+    ``[publisher.checkouts]`` — read through the same ``publish._checkout_path``, so a
+    relative entry resolves against the project root exactly as publish resolves it —
+    union the distinct primaries the instance's EXISTING briefs resolve to, active and
+    archived. Every element is therefore a directory the configuration or an artifact
+    already on disk names: it never derives a repo from the tracker URL, never guesses a
+    sibling that no brief mentions, and never admits a parent.
+    """
+    from . import publish  # lazy: publish imports leaves, avoid an import cycle
+    out: list[Path] = []
+    for spec in sorted(cfg.repo_checkouts):
+        try:
+            p = publish._checkout_path(cfg, spec)
+        except Exception:  # noqa: BLE001 — one bad mapping must not cost the others
+            continue
+        if p.is_dir() and p not in out:
+            out.append(p)
+    for b in sorted(cfg.bundle_root.glob("issue_*")) + \
+            sorted(cfg.bundle_root.glob("completed/issue_*")):
+        p = _primary_checkout(b, cfg)
+        if p is not None and p not in out:
+            out.append(p)
+    return out
+
+
+def _grant_argv(dirs: list[Path], profile: families.FamilyProfile) -> list[str]:
+    """``dirs`` as ``extra_argv`` for a spawn, shaped on the reviewer's own grant in
+    :func:`_run_review_sandboxed`: the flag is emitted ONLY when the family has one. A
+    family with no grounding mechanism (``generic``, families.py:44/:126) is spawned
+    byte-identically to before this existed — the grant is skipped, not faked with a flag
+    the CLI does not have."""
+    if not profile.grounding_flag:
+        return []
+    extra: list[str] = []
+    for p in dirs:
+        extra += [profile.grounding_flag, str(p)]
+    return extra
+
+
+def _bundle_grant(bundles: list[Path], cfg: Config,
+                  profile: families.FamilyProfile) -> list[str]:
+    """Admission for a session that is ABOUT bundles — sign-off (single/batch), Act,
+    publish: exactly what those bundles' briefs resolve to, and nothing else.
+
+    No fallback, deliberately: when this session's own bundle names a repo that is not
+    checked out here, the honest grant is none. Widening to the instance's other targets
+    would hand a sign-off session reach over repos its bundle has nothing to do with.
+    """
+    return _grant_argv(_bundle_targets(bundles, cfg), profile)
+
+
+def _plan_grant(bundles: list[Path], cfg: Config,
+                profile: families.FamilyProfile) -> list[str]:
+    """Admission for the Plan leaf, the one session with no brief to resolve from.
+
+    ``do_plan`` runs on an UNPLANNED bundle and :func:`do_plan_batch`'s CSV/default path
+    picks its ids MID-session, so there is usually nothing to resolve — the set is then
+    the instance's known targets (:func:`_known_targets`). A re-plan over a bundle that
+    DOES carry a brief resolves like any other session and stays at its own checkout.
+    """
+    return _grant_argv(_bundle_targets(bundles, cfg) or _known_targets(cfg), profile)
+
+
+# ----------------------------------------------------------------------------
+# Notes-fetch (issue #65): retrieve a bundle's tracker thread before the Plan beat.
+# ----------------------------------------------------------------------------
+def ensure_notes(cfg: Config, d: Path) -> None:
+    """Run the configured ``[tracker].notes_cmd`` to seed ``d/notes.json`` if it is absent.
+
+    The command (a ``.format(id=)`` shell template) is the project's tracker-scrape tooling;
+    it runs with ``$PDCA_BUNDLE`` set to the bundle dir and is responsible for writing
+    ``notes.json`` there. So the Plan leaf can read the thread without the operator
+    pre-scraping by hand. Best-effort: no command configured, notes already present, or a
+    failing fetch are all non-fatal — Plan then falls back to the CSV / asking the human.
+    """
+    if not cfg.notes_cmd or (d / "notes.json").exists():
+        return
+    d.mkdir(parents=True, exist_ok=True)
+    issue_id = d.name.removeprefix("issue_")
+    cmd = cfg.notes_cmd.format(id=issue_id)
+    env = {**os.environ, "PDCA_BUNDLE": str(d)}
+    try:
+        rc, _, _ = progress.run_with_heartbeat(
+            cmd, cwd=cfg.root, shell=True, env=env, capture=True,
+            label=f"fetch notes {d.name}")
+    except Exception as exc:  # noqa: BLE001 — a failed scrape must not break Plan
+        print(f"leaves: notes fetch for {d.name} failed ({exc}); "
+              "Plan will fall back to the CSV / human", file=sys.stderr)
+        return
+    if rc != 0 or not (d / "notes.json").exists():
+        print(f"leaves: notes fetch for {d.name} produced no notes.json (rc {rc}); "
+              "Plan will fall back to the CSV / human", file=sys.stderr)
+
+
+# ----------------------------------------------------------------------------
+# Leaf 0 — Plan (planner, interactive): human feeds documents → writes brief.md.
+# ----------------------------------------------------------------------------
+def do_plan(d: Path, cfg: Config, csv: str | None = None) -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    sources.seed(cfg, d)  # seed notes.json + sources/ from the configured providers (#65/#102)
+    # The seed above can be what FIRST writes notes.json — including a tracker item
+    # already settled in-issue (#302 review). Re-check AFTER seeding: a RESOLVED bundle
+    # is terminal, and invoking the planner would author a brief that overrides the
+    # marker, letting a settled ticket be built and published.
+    if state.state(d) == state.RESOLVED:
+        print(f"leaves: {d.name} — tracker item is resolved (notes.json `resolved`); "
+              "skipping Plan (terminal, #302)", file=sys.stderr)
+        return
+    # Snapshot the WHOLE bundle root, not just `d`, before the session (#480). A
+    # single-bundle session can `pdca split <id> --accept` mid-session: that writes
+    # authored briefs into new child bundles this call was never handed, and can mark
+    # `d` itself terminal (a split parent). Reviewing only `d` afterwards either
+    # reviews a superseded parent brief on a closed bundle or, once the parent has no
+    # brief, reviews nothing at all — the children never get a look. Matches
+    # `do_plan_batch`'s pre-session snapshot (`:1073-1075`) so both paths select the
+    # same way (`_fresh_plan_briefs`).
+    briefed_before = _brief_snapshot(cfg)
+    if cfg.planner.mode == "command":
+        # The session's exit contract (#331): register the bundle + role so /handoff
+        # and the Stop hook can verify the brief (structure + dependency probe).
+        with handoff.session(cfg, "planner", [d]) as henv:
+            # Admit what this session is told to read (#494). Pre-brief nothing resolves
+            # from `d`, so this is the instance's known target set; a re-plan over an
+            # existing brief resolves to that bundle's own checkout.
+            _invoke(cfg.planner, cfg.root, _plan_prompt(cfg, csv, d), cfg=cfg,
+                    env=henv or None,
+                    extra_argv=_plan_grant([d], cfg, cfg.profile(cfg.planner)))
+    else:
+        _stub_plan(d, cfg)
+    # #301, extended to cover what the session actually produced (#480): review every
+    # bundle it authored or rewrote, not just `d` — `run_plan_advisory_batch` itself
+    # skips a terminal (`close-disposition`) bundle and a placeholder brief.
+    run_plan_advisory_batch(cfg, _fresh_plan_briefs(cfg, briefed_before))
+
+
+def _split_provenance_note(d: Path) -> str:
+    """One sentence of split-child provenance for a prompt, or "" — shared by both (#458).
+
+    The plan and split prompts each tell the model to split an oversized slice, and neither
+    said the one thing that stops a split child being re-split over evidence the split
+    itself created: a `Conflicts with:` entry naming a SIBLING is scheduling metadata the
+    splitter wrote (`split.py:493-499`), not scope this brief acquired.
+    ``plan_policy.size_reasons`` now makes that distinction for the DRIVER's advisory, off
+    the count ``sizing`` exposes; a model reading the brief in the next Plan session reaches
+    its own conclusion first, so the same context has to travel with the prompt or the
+    session re-proposes exactly the split the advisory would argue against.
+
+    Presence of the child edge is the right gate HERE, where the advisory's is not: this
+    adds context to a brief the model is about to read, and "your `Conflicts with` may be
+    inherited — check" is true for every child. It asserts nothing about this brief's score,
+    which is what made presence the wrong predicate for the advisory's verdict.
+    """
+    record = split.read_lineage(d) or {}
+    parent = record.get("parent")
+    if not isinstance(parent, str) or not parent:
+        return ""
+    return (
+        f"Note: this bundle is itself a split child of #{parent} — a `Conflicts with:` "
+        "entry naming one of its own split SIBLINGS is the splitter's ordering metadata "
+        "rather than scope this brief acquired (it is excluded from the size score, and "
+        "the driver's advisory reports a child that still reads oversized beside one as "
+        "driven by inherited/sibling fields), so inherited size is not by itself a reason "
+        "to split again — prefer building unless THIS brief's own new scope justifies "
+        "another split.\n\n"
+    )
+
+
+def _plan_prompt(cfg: Config, csv: str | None, d: Path) -> str:
+    fix_tpl = cfg.templates_dir / "brief.md.tpl"
+    geps_tpl = cfg.templates_dir / "design-proposal.md.tpl"
+    pointer_tpl = cfg.templates_dir / "plan-pointer.md.tpl"
+    issue_id = d.name.removeprefix("issue_")
+    tracker_csv = csv or cfg.tracker_export_csv
+    notes = d / "notes.json"
+    # Source of truth = the tracker row for THIS issue, not a scan of the harness repo.
+    src_line = (
+        f"The issue is {issue_id} on the {cfg.tracker_system or 'tracker'}"
+        + (f" ({cfg.tracker_url}). " if cfg.tracker_url else ". ")
+    )
+    csv_line = (
+        f"Read the row for {issue_id} in the tracker export at '{tracker_csv}' FIRST — "
+        "that row (summary / description / steps) is the authoritative statement of what "
+        "to brief. " if tracker_csv else
+        "Ask the human for the issue's tracker export or details. "
+    )
+    notes_line = (
+        f"If {notes} exists, read it for the full comment thread; if you need the "
+        "discussion and it is absent, ask the human to produce it with the project's "
+        "tracker-scrape tooling, and stop. "
+    )
+    sources_line = (
+        f"Also read EVERY file under {d / 'sources'} if that directory exists — the Plan "
+        "sources (issue #102) compose the bundle's full context there (the tracker JSON, a "
+        "linked proposal / ADR / spec, a CSV row); brief from ALL of it, not just one. "
+    )
+    citation_line = (
+        "Cite the root cause against the target source with `git -C <checkout> log/show "
+        "-- <file>` plus Read/Grep on the checkout — NEVER `cd <checkout> && git ...` "
+        "(it trips a safety prompt; `git -C` is the safe idiom). Do NOT scan THIS harness "
+        "repo for issue information — the tracker is the source. "
+    )
+    return (
+        "You are the Plan leaf of a PDCA cycle. " + src_line + csv_line + notes_line
+        + sources_line + citation_line
+        + f"Together with the human, write brief.md in the bundle directory {d}. Default "
+        f"to {fix_tpl} — it fits bug fixes AND ordinary new functionality. Use {geps_tpl} "
+        "(a design proposal) ONLY for the exception: a change significant enough to "
+        "warrant a proposal (major architecture / API / UX). Not every feature is a "
+        f"design proposal — when in doubt use the normal brief. Use {pointer_tpl} when the "
+        "plan ALREADY lives in a host artifact (an ADR / proposal / normative spec): the "
+        "brief then POINTS at that document (a `Planning artifact:` reference) instead of "
+        "restating it. Keep the parsed `- **Label:** value` field shape; resolve the repo + "
+        "branch target per INTEGRATION §2; set `Difficulty` (the fix's blast-radius / "
+        "cross-file reach, NOT edge-case density) so Do/review routing can key on it. "
+        "One bundle = one brief.md. Plan only.\n\n"
+        # The split belongs to THIS beat and no later one (#358): Do builds what it is
+        # given, and Check can only report that what it built is misshapen. Stated in the
+        # runtime prompt as well as agents/planner.md because the role file alone has
+        # twice proved insufficient — the prompt the model actually receives is built here.
+        # Provenance first, where the bundle has any (#458): the split instruction below is
+        # what a child's inherited `Conflicts with` would otherwise be read against.
+        + _split_provenance_note(d) +
+        "If this slice turns out to be several slices, SPLIT IT IN THIS BEAT — a split "
+        "produces briefs, and briefs are yours. Run `pdca split "
+        f"{issue_id}` to have the splitter draft a proposal, read it with the human, then "
+        f"`pdca split {issue_id} --accept`: that files one tracker issue per child as a "
+        "sub-issue of this one and materialises a bundle each. You do not leave the "
+        "session to file issues by hand. THE RUN YOU ARE IN then drives the children "
+        "(#469): a bundle that reaches `close-disposition = split` while a flow is "
+        "driving it has its children read from the split's lineage record and spliced "
+        "into the waves AFTER its own — independent ones in parallel, dependent ones "
+        "stacked — whatever shape started the run (a CSV-driven batch, an explicit id "
+        "list like `pdca flow 500 501`, or a single id). They spend the run's own pass "
+        "budget, not a fresh one, and a child whose declared dependency cannot be "
+        "resolved is held and named on stderr rather than silently dropped. `--accept` "
+        "never promises more than a live run can guarantee (#566): while a run holds this "
+        "parent — driving it, or holding it as a recovery seed, from this very session or "
+        "from another shell — the line says the run drives the children if it reaches "
+        "them, and that it names any it did not when it ends; it prints today's plain "
+        "`pdca flow <child-ids>` instruction the rest of the time (standalone, once that "
+        "run has ended, or for a child a run already let go). And right before ANY run "
+        "ends, it re-checks every split anywhere in its own drive set — including one "
+        "accepted from another shell on a bundle it has already walked away from — and "
+        "names every child still IN FLIGHT there too, with the command that resumes it "
+        "(one an earlier run already finished is passed over in silence; one that is "
+        "itself a split is passed over as well, but walked THROUGH to its own). Prefer "
+        "fewer, larger children: each costs a full cycle. Before ending the session, "
+        f"verify the Plan exit contract with `/handoff {d.name}` — brief structure plus "
+        "every backticked External-dependencies token registered in [[doctor.checks]] "
+        "with its detect cmd passing. `/handoff` is your self-check; when the session "
+        "ends, the driver reports anything still unmet to the human."
+    )
+
+
+def _stub_plan(d: Path, cfg: Config) -> None:
+    tpl = cfg.templates_dir / "brief.md.tpl"
+    if tpl.exists():
+        shutil.copyfile(tpl, d / "brief.md")
+        return
+    (d / "brief.md").write_text(
+        "# Brief — stub\n\n"
+        "- **Slug:** stub-issue\n"
+        "- **Defect:** stub defect authored by the planner stub.\n"
+        "- **Success criterion:** the stub test passes.\n"
+        "- **Repo + branch target:** example-repo @ main\n"
+        "- **Test file:** test_stub.py\n",
+        encoding="utf-8",
+    )
+
+
+def do_plan_batch(cfg: Config, csv: str | None = None, ids: list[str] | None = None) -> None:
+    """Batch Plan: ONE interactive session may brief several issues at once.
+
+    Default (``ids is None``): the planner reads the documents/CSV and CHOOSES which issues
+    to brief, creating an ``issue_<id>/brief.md`` per chosen issue (``flow.flow_batch``).
+
+    Id-seeded (``ids`` given, issue #65): the planner briefs EACH listed id, reading that
+    bundle's ``notes.json`` as the source — so an explicit set seeded from per-bundle notes
+    (not a tracker CSV) briefs in one shared session. Each id's notes are fetched first via
+    :func:`ensure_notes`; the flow then drives exactly those ids (``flow.flow_ids``).
+    """
+    cfg.bundle_root.mkdir(parents=True, exist_ok=True)
+    # Snapshot the briefed set BY CONTENT HASH so the #301 plan-advisory pass covers
+    # exactly the bundles THIS session briefed or REWROTE (#301 review round 5 — a
+    # name-only snapshot skipped the review when a rerun session updated an existing
+    # brief; unchanged resumptions still skip). An unfilled template copy is NOT
+    # briefed (round 2 — the same placeholder semantics as state.state(), #113): the
+    # session replaces it with a real brief that must get its plan review.
+    briefed_before = _brief_snapshot(cfg)
+    for iid in ids or []:
+        sources.seed(cfg, cfg.bundle(iid))  # seed notes.json + sources/ per bundle (#65/#102)
+    # RESOLVED trackers are terminal and must not enter the Plan session (#302 review):
+    # an authored brief deliberately overrides the marker, so a batch planner briefing
+    # one would re-open a settled ticket for Do/Check. Ids are filtered up front (the
+    # seed just above may be what first resolved them); the CSV/default path — where the
+    # planner picks ids MID-session — is guarded after the session below.
+    if ids is not None:
+        kept = []
+        for iid in ids:
+            if state.state(cfg.bundle(iid)) == state.RESOLVED:
+                print(f"plan: issue_{iid} — tracker item is resolved; excluded from the "
+                      "Plan session (terminal, #302)", file=sys.stderr)
+            else:
+                kept.append(iid)
+        if not kept:
+            print("plan: every listed issue is resolved — nothing to brief", file=sys.stderr)
+            return
+        ids = kept
+    resolved_before = {b.name for b in cfg.bundle_root.glob("issue_*")
+                       if state.state(b) == state.RESOLVED}
+    if cfg.planner.mode == "command":
+        # On the CSV/default path the planner CHOOSES the ids mid-session, so the per-bundle
+        # seed above never ran for them. Snapshot which bundles ALREADY HAD a brief so we can
+        # flag any briefed THIS session that the seed never reached — including a brief.md
+        # added to a pre-existing UNPLANNED dir, which a dir-name snapshot would miss (#190).
+        before = set() if ids else {d.name for d in cfg.bundle_root.glob("issue_*")
+                                    if (d / "brief.md").exists()}
+        # Exit contract (#331). Id-seeded: register the listed bundles, with
+        # require_artifact=False — the prompt documents "leave it UNPLANNED (write no
+        # brief.md) and say why" as legitimate, so the reap passes an absent brief and
+        # reports a malformed one (#534). CSV/default: the planner picks ids MID-session,
+        # so no set can be registered — the session names its work via /handoff.
+        seeded = [cfg.bundle(i) for i in (ids or [])]
+        with handoff.session(cfg, "planner", seeded,
+                             require_artifact=False) as henv:
+            # Same admission as the single-bundle Plan (#494): an id-seeded batch is
+            # normally UNPLANNED and the CSV/default path has no ids at all, so both
+            # fall through to the instance's known targets.
+            _invoke(cfg.planner, cfg.root, _plan_batch_prompt(cfg, csv, ids), cfg=cfg,
+                    env=henv or None,
+                    extra_argv=_plan_grant(seeded, cfg, cfg.profile(cfg.planner)))
+        if ids is None:
+            _warn_unseeded_briefs(cfg, before)
+    else:
+        _stub_plan_batch(cfg, ids)
+    # RESOLVED rejection runs BEFORE the plan-advisory pass: a brief set aside here no
+    # longer exists, so the advisory batch never reviews (or revises against) a brief
+    # the resolution guard is about to retract.
+    _reject_resolved_briefs(cfg, resolved_before)
+    # #301: one advisory pass over the freshly briefed OR rewritten bundles, then ONE
+    # revision session if any review found something. No-op unless
+    # [[leaves.plan_advisory]] is configured.
+    run_plan_advisory_batch(cfg, _fresh_plan_briefs(cfg, briefed_before))
+
+
+def _reject_resolved_briefs(cfg: Config, resolved_before: set[str]) -> None:
+    """Reject a brief the Plan session authored for a bundle that was RESOLVED going in
+    (#302 review). On the CSV/default path the planner picks ids MID-session, so the
+    up-front id filter cannot protect a resolved tracker; an authored brief would
+    override the marker and re-open the settled ticket for Do/Check. The brief is set
+    aside (not deleted — the planner's work stays inspectable), loudly, so the bundle
+    reads RESOLVED again before the drive set is built.
+
+    Revalidated first (#302 review round 6): the marker is a CACHE of the closure, and
+    on this path no up-front id filter ever checked the live tracker — the planner may
+    have briefed the item precisely BECAUSE the tracker reopened it. Discarding that
+    brief would lock the reopened issue out of every batch run until someone hand-edits
+    notes.json. Only the bundles the session actually briefed are checked (one tracker
+    call each), never the whole RESOLVED population."""
+    for name in sorted(resolved_before):
+        b = cfg.bundle_root / name
+        bp = b / "brief.md"
+        if bp.exists() and state.state(b) != state.RESOLVED:
+            if sources.tracker_issue_reopened(cfg, name.removeprefix("issue_")):
+                # DEFER, don't drive (#302 review round 10): this brief was authored
+                # while the closure-era notes.json was still in place — it never saw
+                # the reopen discussion, and keeping it would carry that stale
+                # context through Do/Check (and possibly publish) in this very run.
+                # Set THIS brief aside, clear the marker + set the notes aside, and
+                # the bundle reads UNPLANNED — the next Plan seeds the fresh thread
+                # and re-briefs with the reopen context in view.
+                # Brief FIRST, marker SECOND (#302 review round 15): clearing the
+                # marker while the stale brief could not be moved would leave the
+                # bundle reading PLANNED — straight into this run's drive set with
+                # the stale context the deferral exists to keep out.
+                aside = _brief_aside(bp, "brief.stale-reopen-context")
+                if aside is None:
+                    # The helper printed what happened; the marker was NOT touched,
+                    # so the bundle stays terminal (RESOLVED) — fail closed.
+                    continue
+                cleared = sources.clear_resolved_marker(b)  # closure-era notes aside
+                brief_note = ("the brief aside (" + aside.name + ")"
+                              if aside is not bp else "the brief removed")
+                if cleared:
+                    print(f"plan: {name} — the tracker issue is OPEN again, but this "
+                          f"session's brief was authored from the closure-era notes; "
+                          f"cleared the stale resolved marker, set the notes aside / "
+                          f"{brief_note}, and DEFERRED the bundle — the next Plan "
+                          "re-briefs it from the fresh thread", file=sys.stderr)
+                else:
+                    # #302 review round 11: never claim "cleared" over a failed
+                    # rename — the bundle honestly remains RESOLVED (the stale brief
+                    # is still set aside: it must not drive in any case).
+                    print(f"plan: {name} — the tracker issue is OPEN again, but the "
+                          f"closure-era notes could not be set aside; {brief_note} "
+                          "and the bundle remains RESOLVED — fix the bundle "
+                          "directory, then re-run", file=sys.stderr)
+                continue
+            aside = _brief_aside(bp, "brief.superseded-by-resolution")
+            if aside is None or aside is bp:
+                continue  # the helper printed what happened (or the DELETED line)
+            print(f"plan: {name} — the session briefed a RESOLVED tracker item; the brief "
+                  f"was set aside as {aside.name} (the issue was settled in the tracker; "
+                  "reopen it there to plan it again)", file=sys.stderr)
+
+
+def _brief_aside(bp: Path, stem: str) -> Path | None:
+    """Move ``bp`` out of the active brief slot, FAIL CLOSED (#302 review round 14).
+
+    A unique destination per rejection (#302 review round 3) keeps every set-aside
+    artifact inspectable. When the rename fails (locked file on Windows, an I/O
+    error) the brief is DELETED instead — losing the planner's inspectable copy
+    beats the alternative, where an authored brief survives the failed rejection,
+    shadows the still-present resolved marker as PLANNED on the next run, and drives
+    stale/settled work through Do/Check.
+
+    Returns the set-aside path on a successful rename; ``bp`` ITSELF when the
+    fallback deletion emptied the slot (#302 review round 16 — the slot IS empty, so
+    a reopen deferral may still proceed to clear the marker; renaming being
+    unavailable must not keep suppressing the reopened issue run after run); and
+    ``None`` only when the slot could NOT be emptied, after a loud
+    manual-intervention line. The helper prints what happened on every non-rename
+    path; contained per-bundle — a failure must not abort the batch Plan session's
+    remaining bundles."""
+    aside = bp.with_name(f"{stem}.md")
+    n = 2
+    while aside.exists():
+        aside = bp.with_name(f"{stem}-{n}.md")
+        n += 1
+    try:
+        bp.rename(aside)
+        return aside
+    except OSError:
+        try:
+            bp.unlink()
+            print(f"plan: {bp.parent.name} — could not set the brief aside (rename "
+                  f"failed); it was DELETED instead so it cannot drive settled/stale "
+                  "work", file=sys.stderr)
+            return bp  # slot emptied — the caller's deferral/rejection proceeds
+        except OSError as exc:
+            print(f"plan: {bp.parent.name} — could not set aside OR remove the "
+                  f"active brief ({exc}); MANUAL INTERVENTION required: the bundle "
+                  f"will read PLANNED over a resolved tracker item until {bp} is "
+                  "moved out of the way", file=sys.stderr)
+            return None
+
+
+def _warn_unseeded_briefs(cfg: Config, before: set[str]) -> None:
+    """After a CSV/default batch Plan, flag issues briefed THIS session whose Plan sources were
+    never seeded (#190).
+
+    On the id-seeded path each bundle's notes/sources are fetched first; on the CSV/default
+    path the planner picks the ids *mid-session*, so that per-bundle seed never runs — those
+    briefs rest on the CSV row alone, missing the reporter thread / attached repro. ``before``
+    is the set of bundles that already carried a ``brief.md`` before this session (NOT just the
+    existing dir names — an ``issue_<id>`` dir can pre-exist UNPLANNED and gain its brief now),
+    so a bundle is freshly briefed iff it has a brief that ``before`` lacked. We never auto-run
+    the seeders unattended (a tracker scraper is human-in-the-loop — a browser, a login), so
+    surface it as a VISIBLE sub-step: name the ids and tell the human to seed + refine before
+    the work is driven. No-op when no Plan source is configured (the CSV/docs are then the only
+    source) or every fresh brief already carries notes.json / a sources/ dir."""
+    if not (cfg.notes_cmd or cfg.plan_sources):
+        return
+    unseeded = sorted(
+        d.name.removeprefix("issue_")
+        for d in cfg.bundle_root.glob("issue_*")
+        if d.name not in before and (d / "brief.md").exists()
+        and not (d / "notes.json").exists() and not (d / "sources").is_dir())
+    if not unseeded:
+        return
+    print(
+        f"\nplan: {len(unseeded)} issue(s) briefed this session WITHOUT seeded tracker notes "
+        f"({', '.join(unseeded)}) — the planner chose them mid-session, so they rest on the CSV "
+        f"row alone (no reporter discussion, attached repro, or 'fixed in' hints). Seed their "
+        f"notes/sources (your configured Plan source is human-in-the-loop — a browser / login) "
+        f"and refine the briefs before driving them; don't let the thin briefs flow on "
+        f"unreviewed (#190).",
+        file=sys.stderr)
+
+
+def _plan_batch_prompt(cfg: Config, csv: str | None, ids: list[str] | None = None) -> str:
+    fix_tpl = cfg.templates_dir / "brief.md.tpl"
+    geps_tpl = cfg.templates_dir / "design-proposal.md.tpl"
+    tpl_line = (
+        f"use the fitting template: a bug fix → {fix_tpl}; a feature / enhancement → "
+        f"{geps_tpl}. Keep the parsed `- **Label:** value` field shape; set `Difficulty` "
+        "(the change's blast-radius / cross-file reach, NOT edge-case density) for routing")
+    if ids:
+        listing = ", ".join(ids)
+        return (
+            "You are the Plan leaf of a PDCA cycle, in BATCH mode over a SPECIFIC id list: "
+            f"{listing}. Brief EACH listed id. For each, read its bundle's "
+            f"`{cfg.bundle_root}/issue_<id>/notes.json` (the seeded triage notes / comment "
+            "thread) as the source of truth"
+            + (f", and consult the row for it in the tracker export at '{csv}' too" if csv else "")
+            + ". The notes/tracker are the source: do NOT scan THIS harness repo for issue "
+            "info, and cite the target source via `git -C <checkout> ...` (never "
+            f"`cd <checkout> && ...`). Write `{cfg.bundle_root}/issue_<id>/brief.md` for each "
+            f"— {tpl_line}. If a listed id genuinely should NOT be briefed (no actionable "
+            "defect), leave it UNPLANNED (write no brief.md) and say why. One id = one "
+            "`issue_<id>/brief.md`. Plan only — do not implement. After each brief is "
+            "written, verify it with `/handoff issue_<id>` (ids required, one bundle per "
+            "invocation). That is your self-check; when the session ends, the driver "
+            "re-checks every listed bundle and reports anything unmet to the human."
+        )
+    tracker_csv = csv or cfg.tracker_export_csv
+    src = f"the tracker export at '{tracker_csv}'" if tracker_csv \
+        else "the input documents the human shares"
+    return (
+        "You are the Plan leaf of a PDCA cycle, in BATCH mode. With the human, read "
+        f"{src} on the {cfg.tracker_system or 'tracker'} and decide which issues to brief "
+        "— there may be SEVERAL. The tracker rows are the source of truth: do NOT scan "
+        "THIS harness repo for issue info, and cite the target source via "
+        "`git -C <checkout> ...` (never `cd <checkout> && ...`). For EACH chosen issue "
+        f"create a bundle directory `{cfg.bundle_root}/issue_<id>/` containing a brief.md "
+        f"— {tpl_line}; `<id>` is the "
+        "tracker id. One issue = one `issue_<id>/brief.md`. Plan only — do not implement. "
+        "After EACH brief is written, verify it with `/handoff issue_<id>` (ids required "
+        "— the driver cannot know mid-session choices, so the passing /handoff runs are "
+        "how the session names its work; if none passed, the driver tells the human "
+        "when the session ends)."
+    )
+
+
+def _stub_plan_batch(cfg: Config, ids: list[str] | None = None) -> None:
+    # Id-seeded: brief exactly the listed ids; else two default bundles (offline slice).
+    for iid in (ids if ids else ("BATCH1", "BATCH2")):
+        d = cfg.bundle(iid)
+        d.mkdir(parents=True, exist_ok=True)
+        _stub_plan(d, cfg)
+
+
+# ----------------------------------------------------------------------------
+# Leaf 1 — Do (builder, headless): writes patch.diff + the test + build-notes.md.
+# ----------------------------------------------------------------------------
+def attempt_no(d: Path) -> int:
+    """This bundle's current Do attempt number (1-based). Mirrors the driver's iteration
+    numbering: each iterate archives the prior attempt into ``iteration-v<N>/``, so the
+    count of archives + 1 is the attempt about to run."""
+    return len(list(d.glob("iteration-v*"))) + 1
+
+
+def _leaf_from_spec(spec: dict, default: LeafConfig) -> LeafConfig:
+    """A LeafConfig from an escalation/variant spec, inheriting any field the spec omits
+    from ``default`` (so a variant need only override what differs, e.g. just ``argv``)."""
+    return LeafConfig(
+        mode=spec.get("mode") or default.mode,
+        family=spec.get("family", default.family),
+        argv=list(spec.get("argv") or default.argv),
+        interactive=bool(spec.get("interactive", default.interactive)),
+        agent=spec.get("agent", default.agent),
+        # NB: a variant spec's `model` key is the #167 SELECTOR name (matched by the
+        # brief's `Do model:`), not a CLI model id — so the profile-mapped CLI model
+        # is inherited from the default leaf only; a variant sets its model via argv.
+        model=default.model,
+        effort=spec.get("effort", default.effort),
+        # Memory bound (#420): the spec's own `memory_max` wins, else INHERIT the base
+        # leaf's — a variant/escalation of the builder is the same appetite as the
+        # builder, so it must not silently lose its base leaf's cap OR its "off"
+        # opt-out. An unparseable spec value is "" (noted on stderr) and therefore
+        # inherits too, never a guessed number.
+        memory_max=(memory_max_value(spec.get("memory_max", ""),
+                                     "a [[leaves.*]] variant/escalation memory_max")
+                    or default.memory_max),
+    )
+
+
+def _when_matches(when: dict | None, d: Path, *, default: bool) -> bool:
+    """The single ``when = {field, substring}`` gate predicate (issue #152): the substring is
+    matched case-insensitively against the named brief field. An empty/absent condition
+    yields ``default`` — the one thing the callers differ on: an advisory leaf with no
+    ``when`` runs (``default=True``), a builder variant with no ``when`` is opt-in
+    (``default=False``). Shared by :func:`_advisory_applies` (#64) and :func:`_variant_applies`
+    (#134), so the field/substring matching lives in exactly one place."""
+    when = when or {}
+    needle = (when.get("substring") or "").lower()
+    if not needle:
+        return default
+    return needle in brief.field(d / "brief.md", when.get("field", "")).lower()
+
+
+def _variant_applies(spec: dict, d: Path) -> bool:
+    """True iff this builder variant's ``when`` matches bundle ``d``'s brief (issue #134).
+    **Default-open**: a variant with no condition (or an absent/non-matching field) does NOT
+    apply, so a missing difficulty tag falls back to the default builder rather than silently
+    reducing capability. Delegates to the shared :func:`_when_matches`."""
+    return _when_matches(spec.get("when"), d, default=False)
+
+
+def _routed_variant(d: Path, cfg: Config) -> dict | None:
+    """The first ``[[leaves.builder_variant]]`` whose ``when`` matches the brief (issue
+    #134), or ``None``."""
+    return next((spec for spec in cfg.builder_variants if _variant_applies(spec, d)), None)
+
+
+def _explicit_model_variant(d: Path, cfg: Config) -> dict | None:
+    """The builder variant the brief names by ``- **Do model:** <name>`` (issue #167), or
+    ``None``. An explicit per-bundle choice matches a variant's ``model`` key (case-folded)
+    and **overrides** the ``when`` routing — so a bundle can pin its Do backend directly,
+    no ``when`` gate required. A name matching no variant is a no-op (warned), falling back
+    to the ``when`` routing / default builder."""
+    if not cfg.builder_variants:  # nothing to match; skip the brief read (no variants ⇒ no-op)
+        return None
+    wanted = brief.do_model(d / "brief.md")
+    if not wanted:
+        return None
+    for spec in cfg.builder_variants:
+        if str(spec.get("model", "")).strip().lower() == wanted.lower():
+            return spec
+    print(f"leaves: brief 'Do model: {wanted}' matches no [[leaves.builder_variant]] "
+          "`model` — using the routed/default builder", file=sys.stderr)
+    return None
+
+
+SIZING_FILE = "sizing.json"
+
+
+def _pointer_clause(d: Path, cfg: Config) -> str:
+    """What to tell the sizer about a pointer brief's planning artifact."""
+    artifact = brief.planning_artifact(d / "brief.md")
+    if not artifact:
+        return ""
+    resolved = _artifact_path(d, cfg, artifact)
+    if resolved is None:
+        # Say so rather than naming a path the leaf cannot open: a URL, or an artifact
+        # outside the tree. Sizing the pointer alone is then the honest answer, and the
+        # verdict is not cached because neither the model nor the digest saw the plan.
+        return (f" — the brief points at `{artifact}`, which is not readable from here, so "
+                "size what the brief itself states and say in `confidence` that the "
+                "authoritative plan was unavailable")
+    return (f" AND the planning artifact it points at ({resolved}) — for a pointer brief "
+            "THAT document is the plan, and sizing the pointer alone would score a "
+            "three-migration project as one small slice")
+
+
+def _sizer_prompt(d: Path, cfg: Config) -> str:
+    return (
+        "You are the SIZER. Read " + str(d / "brief.md")
+        + _pointer_clause(d, cfg)
+        + ". Answer ONE question: "
+        "how many INDEPENDENTLY SHIPPABLE outcomes does this brief describe? An outcome is "
+        "independently shippable if it could be its own PR — its own defect, its own success "
+        "criterion, its own test — without waiting on the others.\n\n"
+        "This is the judgment structural features cannot make. Do NOT re-estimate size from "
+        "word counts or file counts; the driver already has those. Size is not the question; "
+        "DECOMPOSABILITY is.\n\n"
+        "Write exactly one file, " + str(d / SIZING_FILE) + ", and nothing else:\n"
+        '{"band": "ok|watch|oversized", "independent_outcomes": ["…"], '
+        '"proposed_seams": ["…"], "confidence": "low|medium|high"}\n\n'
+        "band: `ok` = one outcome. `watch` = arguably two, or one with a large uncertain "
+        "surface. `oversized` = two or more that could each ship alone.\n"
+        "Propose seams; do NOT cut them — the split is authored in PLAN, by the human, "
+        "before Do dispatches."
+    )
+
+
+def _read_sizing(d: Path) -> dict | None:
+    """The sizer's verdict, or None if absent/unreadable/not an object.
+
+    Tolerant like every other bundle-file read: a malformed verdict must leave the
+    structural estimate exactly as it was, never crash the beat that consulted it.
+    """
+    p = d / SIZING_FILE
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _sizer_escalates(verdict: dict | None, spec: dict) -> bool:
+    """Whether ``spec`` fires against the first-pass verdict.
+
+    Matches on the leaf's own output — band and/or confidence — because that is the only
+    place the signal exists. An absent verdict never escalates: a leaf that failed to
+    answer is not evidence that a stronger one would.
+    """
+    if not verdict:
+        return False
+    bands = [str(b).lower() for b in spec.get("on_band", [])]
+    confs = [str(c).lower() for c in spec.get("on_confidence", [])]
+    band = str(verdict.get("band", "")).lower()
+    conf = str(verdict.get("confidence", "")).lower()
+    # OR across the declared conditions, and a spec declaring NEITHER never fires — an
+    # empty spec must not escalate every bundle, which is the failure a truthiness test
+    # would produce.
+    return (bool(bands) and band in bands) or (bool(confs) and conf in confs)
+
+
+def run_sizer(d: Path, cfg: Config) -> dict | None:
+    """Run the cheap-model size judgment over a brief, returning its verdict (#320).
+
+    Optional by construction: with no ``[leaves.sizer]`` in ``pdca.toml`` the leaf is a
+    stub and this writes nothing a model produced, so an instance taking a `copier update`
+    gains no model call it never asked for.
+
+    Escalation is over the leaf's OWN first pass — a `watch` or low-confidence answer is
+    exactly when a stronger model earns its cost, and no brief field predicts that. At most
+    one escalation runs: this is a corroborating signal, not a search.
+    """
+    bp = d / "brief.md"
+    if not bp.exists():
+        return None
+    if cfg.sizer.mode != "command":
+        return _stub_sizer(d)
+
+    # One paid verdict per BRIEF, not per beat. The policy is evaluated before Do and
+    # again before Check (#321), so a naive re-invoke doubles the cost of every cycle —
+    # four calls with an escalation — and lets the second nondeterministic answer overwrite
+    # the first. The verdict is a function of the brief, so it is stamped with the brief's
+    # digest and reused while that digest holds; an iterate that rewrites the brief changes
+    # it and earns a fresh pass. This also subsumes the stale-artifact problem the
+    # unconditional unlink was guarding: a verdict from a DIFFERENT brief never matches.
+    digest = _sizer_key(d, cfg, bp)
+    existing = _read_sizing(d)
+    if digest and existing is not None and existing.get("brief_sha") == digest:
+        return existing
+
+    verdict = _sizer_pass(cfg.sizer, d, cfg, "sizer")
+    for spec in cfg.sizer_escalation:
+        if _sizer_escalates(verdict, spec):
+            escalated = _sizer_pass(_leaf_from_spec(spec, cfg.sizer), d, cfg,
+                                    "sizer (escalated)")
+            if escalated is not None:
+                return _stamp(d, escalated, digest)
+            # An escalation that produced nothing must not discard the first pass: the
+            # cheap verdict is still the best evidence available. Restore it to DISK too —
+            # the escalation pass unlinks the artifact before running, so returning it only
+            # in memory would leave the bundle without the sizing record it did earn.
+            return _stamp(d, verdict, digest)
+    return _stamp(d, verdict, digest)
+
+
+def current_sizing(d: Path, cfg: Config) -> dict | None:
+    """The stored verdict IF it was given for the brief as it stands now — else None.
+
+    `_read_sizing` is the raw read and does not check the stamp. Every FREE reader — the
+    BUILT-time advisory, `pdca size` — must use this instead: `sizing.json` is not archived
+    by an iterate, so a bundle re-planned from `oversized` to a small single-outcome brief
+    still carries the old verdict on disk. Showing those seams, or folding that band into
+    a fresh estimate, states the opposite of the truth about the current brief.
+
+    A verdict whose inputs cannot be fingerprinted (an unfetchable planning artifact) was
+    never stamped, so it is not reusable either — the same safe direction `_sizer_key` takes.
+    """
+    verdict = _read_sizing(d)
+    bp = d / "brief.md"
+    if verdict is None or not bp.exists():
+        return None
+    key = _sizer_key(d, cfg, bp)
+    return verdict if key and verdict.get("brief_sha") == key else None
+
+
+def _sizer_key(d: Path, cfg: Config, bp: Path) -> str:
+    """The cache key for a sizing verdict, or "" when the inputs cannot be fingerprinted.
+
+    A POINTER brief is the reason this is not just the brief's digest: for those, the
+    planning artifact IS the plan and the sizer is told to read it, so hashing `brief.md`
+    alone would reuse an `ok` verdict after the artifact grew from one outcome to three —
+    suppressing exactly the advisory the pointer case exists to produce.
+
+    An artifact that cannot be read — a URL, or a path outside the tree — yields "" and the
+    verdict is NOT cached. Paying for a re-run is the safe direction when the alternative
+    is silently trusting a verdict whose input may have changed underneath it.
+    """
+    h = hashlib.sha256(bp.read_bytes())
+    # The CONFIGURATION is an input too. Adding a `[[leaves.sizer_escalation]]` that fires
+    # on low confidence, or pointing the leaf at a stronger model, must earn a fresh
+    # verdict — otherwise the cached answer from the weaker pass is returned and the
+    # escalation the operator just configured never runs.
+    h.update(repr([
+        (cfg.sizer.mode, cfg.sizer.family, tuple(cfg.sizer.argv), cfg.sizer.agent,
+         cfg.sizer.model, cfg.sizer.effort),
+        # ORDERED per-spec, not a flattened sorted set: `run_sizer` returns on the FIRST
+        # matching escalation, so reordering two rules changes which stronger model runs.
+        # Flattening gave both orders the same key, and the cached verdict from the rule
+        # that used to win was returned instead of running the one now promoted.
+        tuple(tuple(sorted((k, repr(v)) for k, v in spec.items()))
+              for spec in cfg.sizer_escalation),
+    ]).encode("utf-8"))
+    artifact = brief.planning_artifact(bp)
+    if not artifact:
+        return h.hexdigest()[:16]
+    resolved = _artifact_path(d, cfg, artifact)
+    if resolved is None:
+        return ""
+    try:
+        h.update(resolved.read_bytes())
+    except OSError:
+        return ""
+    return h.hexdigest()[:16]
+
+
+def _artifact_path(d: Path, cfg: Config, artifact: str) -> Path | None:
+    """The planning artifact as a path the LEAF can open, or None.
+
+    Resolved against the bundle first and then the target checkout, and returned ABSOLUTE
+    — the sizer runs with the bundle as its cwd, so handing it the brief's target-relative
+    string (`docs/adr/0042.md`) names a file it cannot find. The prompt and the cache key
+    both go through here, or the key hashes a document the model never read.
+
+    A URL, or a path that resolves nowhere, yields None: the leaf then sizes the brief
+    alone and the verdict is not cached, since neither the model nor the digest can see
+    what the pointer points at.
+
+    **CONTAINED to the bundle or the target checkout.** Absolute paths, `..` traversal and
+    symlink escapes are refused. `Path(root) / "/etc/passwd"` returns `/etc/passwd` — an
+    absolute join silently discards the root — so without this a brief declaring
+    `Planning artifact: /etc/passwd` would have the prompt instruct a command-mode sizer,
+    with `Read` pre-authorised, to open it.
+
+    The rubric loader already refuses the same shapes, and the argument is stronger here:
+    a rubric path comes from `pdca.toml`, which a human wrote, while a planning artifact
+    comes from `brief.md`, which a MODEL wrote.
+    """
+    if not artifact or Path(artifact).is_absolute():
+        return None
+    for root in (d, rubric_mod._target_root(d, cfg)):
+        if root is None:
+            continue
+        try:
+            base = Path(root).resolve()
+            candidate = (base / artifact).resolve()
+            candidate.relative_to(base)          # refuses `..` and symlink escapes
+            if candidate.is_file():
+                return candidate
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _stamp(d: Path, verdict: dict | None, digest: str) -> dict | None:
+    """Record which brief a verdict was given for, and (re)write it to the bundle.
+
+    Also restores the artifact after a failed escalation: `_sizer_pass` unlinks before each
+    run, so a fallback that returned the cheap verdict only in memory left the bundle with
+    no sizing record at all.
+    """
+    if verdict is None:
+        return None
+    stamped = {**verdict, "brief_sha": digest} if digest else dict(verdict)
+    try:
+        (d / SIZING_FILE).write_text(json.dumps(stamped, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # the stamp is a cache key, never a hard requirement
+    return stamped
+
+
+def _sizer_pass(leaf: LeafConfig, d: Path, cfg: Config, label: str) -> dict | None:
+    """One sizer invocation. Never raises, never reuses a previous verdict.
+
+    ADVISORY means advisory: a non-zero exit, a rate limit or a missing executable must
+    leave the structural estimate usable rather than abort the beat that consulted it —
+    an optional corroborating signal has no business taking the cycle down with it.
+
+    The artifact is unlinked FIRST so a pass that exits cleanly without writing cannot be
+    read as having produced the previous run's answer — most likely when an existing
+    bundle is switched from stub to command mode, where a stale `ok` would silently stand
+    in for a verdict the model never gave.
+    """
+    (d / SIZING_FILE).unlink(missing_ok=True)
+    try:
+        _invoke(leaf, d, _sizer_prompt(d, cfg), cfg=cfg, label=label)
+    except Exception as exc:  # noqa: BLE001 — an advisory leaf never aborts the beat
+        print(f"leaves: {label} did not run ({exc}) — continuing on the structural "
+              "estimate alone", file=sys.stderr)
+        return None
+    return _read_sizing(d)
+
+
+def _stub_sizer(d: Path) -> dict | None:
+    """Offline placeholder: a deterministic `ok` verdict so the suite stays green with no
+    model, and so `combine()` is exercised on the stub path exactly as on the real one."""
+    verdict = {"band": "ok", "independent_outcomes": [], "proposed_seams": [],
+               "confidence": "low", "stub": True}
+    (d / SIZING_FILE).write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+    return verdict
+
+
+def _split_prompt(d: Path, cfg: Config) -> str:
+    tpl = cfg.templates_dir / "split-proposal.md.tpl"
+    # READ the sizer's stored verdict, never re-invoke it: the leaf that judged this slice
+    # oversized already answered "how many independently shippable outcomes?" and proposed
+    # where they divide. Sizing the brief again here would pay a second model to rediscover
+    # what the first one wrote down — and the splitter is the one consumer that needs those
+    # seams most.
+    # `current_sizing`, not the raw read: after an iterate-plan the brief changes while
+    # `sizing.json` stays, and handing the splitter seams drawn from a replaced brief tells
+    # it the old decomposition describes the current one.
+    verdict = current_sizing(d, cfg) or {}
+    est = sizing.combine(sizing.estimate(d / "brief.md", cfg), verdict or None, cfg)
+    # LIST or nothing. The verdict is model output and the contract tolerates an untidy
+    # schema — but tolerant has to mean ignored, not iterated: `proposed_seams: 1` raised
+    # TypeError here, and `do_split` has already unlinked the previous proposal by then.
+    _out = verdict.get("independent_outcomes")
+    _seam = verdict.get("proposed_seams")
+    outcomes = [str(o) for o in _out] if isinstance(_out, list) else []
+    seams = [str(s_) for s_ in _seam] if isinstance(_seam, list) else []
+    prior = ""
+    if outcomes or seams:
+        prior = (
+            "\n\nThe sizer has already looked at this brief. Treat its answer as a "
+            "STARTING POINT, not a verdict to ratify — it saw only the brief, you may "
+            "disagree, and saying so with a reason is more useful than agreeing.\n"
+            + ("  outcomes it identified: " + "; ".join(outcomes) + "\n" if outcomes else "")
+            + ("  seams it proposed: " + "; ".join(seams) + "\n" if seams else ""))
+    return (
+        f"You are the SPLITTER. Read {d / 'brief.md'}. This slice has been judged too "
+        "large to build as one cycle. The driver sized it "
+        f"{est.band}: {'; '.join(est.reasons) or 'no structural signal'}.{prior}\n\n"
+        # A split OF a split child is the case this exists for (#458): the splitter is being
+        # asked to decompose a bundle whose size may be the previous split's own metadata.
+        + _split_provenance_note(d) +
+        f"Fill {tpl} and write the result to {d / split.PROPOSAL} — exactly one file, "
+        "nothing else. Do NOT create bundles, branches or tracker items, and do NOT edit "
+        "brief.md. The split is authored in PLAN, by the human: they read your proposal "
+        "and run `pdca split <id> --accept`, which files the child issues and materialises "
+        "the briefs. You write prose; that command does the rest.\n\n"
+        "Each child must be independently shippable — its own defect, success criterion, "
+        "test and PR. Prefer fewer, larger children: each costs a full cycle, so a split "
+        "into six that could have been two is its own kind of oversizing.\n\n"
+        "The `Depends on:` / `Conflicts with:` fields BETWEEN children are the point. Get "
+        "them right and the scheduler needs no new code — independent children run in one "
+        "parallel wave, dependent ones stack. Keep the `<!-- pdca:child … -->` delimiters "
+        "exactly as the template writes them: a child body is a full draft brief and may "
+        "contain arbitrary headings and fenced code, so nothing that could appear inside a "
+        "child can mark its edge."
+    )
+
+
+def do_split(d: Path, cfg: Config) -> int:
+    """Run the splitter leaf over a briefed bundle (#322). Returns a process code."""
+    if not (d / "brief.md").exists():
+        print(f"split: {d.name} has no brief.md to split", file=sys.stderr)
+        return 1
+    # A frozen bundle is history. Writing a fresh proposal into a COMPLETE or DISCONTINUED
+    # record — and letting --accept overwrite its close marker and build notes — would
+    # rewrite an audit trail and spawn work nobody asked for.
+    st = state.state(d)
+    if st in (state.COMPLETE, state.DISCONTINUED, state.RESOLVED):
+        print(f"split: {d.name} is {st} — refusing to split a frozen bundle",
+              file=sys.stderr)
+        return 1
+    # Clear any previous proposal FIRST: `_invoke` ignores an interactive leaf's exit code,
+    # so a cancelled rerun would otherwise leave the old file in place and report success,
+    # and --accept would materialise a proposal for an earlier version of the brief.
+    (d / split.PROPOSAL).unlink(missing_ok=True)
+    if cfg.splitter.mode == "command":
+        _invoke(cfg.splitter, d, _split_prompt(d, cfg), cfg=cfg, label="splitter")
+    else:
+        # Never a silent skip (#466): the operator's only OTHER signal that no model ran
+        # is recognising the fixture text by eye, after `--accept` has already had a
+        # chance to file it. Say so here, at the moment the stub branch is taken.
+        print(f"split: [leaves.splitter] mode is {cfg.splitter.mode!r}, not \"command\" — "
+              f"writing the OFFLINE STUB proposal for {d.name}; `--accept` without --ids "
+              "will refuse to file its children", file=sys.stderr)
+        _stub_split(d)
+    if not (d / split.PROPOSAL).exists():
+        print(f"split: the splitter produced no {split.PROPOSAL} in {d}", file=sys.stderr)
+        return 1
+    print(f"{d / split.PROPOSAL}")
+    return 0
+
+
+def _stub_split(d: Path) -> None:
+    """Offline placeholder: a two-child proposal, the second DEPENDING on the first.
+
+    Deliberately not two independent children: a stub whose output produced a single wave
+    would let the round-trip test pass without ever exercising the label→id rewrite, which
+    is the part of `--accept` most worth proving.
+    """
+    (d / split.PROPOSAL).write_text(
+        "<!-- pdca:split-proposal v1 -->\n"
+        # Provenance that SURVIVES the process boundary (#466): `--accept` runs in a
+        # different process from `do_split`, where an in-memory "this was a stub" flag
+        # could not reach it, and this proposal is otherwise byte-identical in shape to
+        # a real splitter's output. `split.is_stub_proposal` reads this back.
+        "<!-- pdca:split-proposal-stub -->\n"
+        f"# Split proposal — {d.name}\n\n## Wave sketch\n\n"
+        "child-2 stacks on child-1 (stub).\n\n"
+        "<!-- pdca:child child-1 -->\n"
+        "- **Slug:** stub-child-one\n"
+        "- **Defect / goal:** the first independently shippable outcome\n"
+        "- **Success criterion:** it ships alone\n"
+        "- **Test file:** tests/test_one.py\n"
+        "- **Difficulty:** low\n"
+        "<!-- pdca:end child-1 -->\n\n"
+        "<!-- pdca:child child-2 -->\n"
+        "- **Slug:** stub-child-two\n"
+        "- **Defect / goal:** the second, which builds on the first\n"
+        "- **Success criterion:** it ships after child-1\n"
+        "- **Test file:** tests/test_two.py\n"
+        "- **Difficulty:** low\n"
+        "- **Depends on:** child-1\n"
+        "<!-- pdca:end child-2 -->\n",
+        encoding="utf-8")
+
+
+def select_builder(d: Path, cfg: Config, n: int) -> LeafConfig:
+    """Pick the Do builder backend for bundle ``d`` on attempt ``n`` (issues #134/#135/#167).
+
+    Layers over the default ``[leaves.builder]`` (each later one wins):
+      1. **Variant pick** — the brief may name a backend **explicitly** via
+         ``- **Do model:** <name>`` (#167): the first ``[[leaves.builder_variant]]`` whose
+         ``model`` matches is used, overriding the ``when`` routing. Otherwise the first
+         variant whose ``when`` matches the brief wins (#134, e.g. difficulty=high).
+         Default-open: no explicit name and no ``when`` match keeps the default builder.
+      2. **Escalation ladder (#135)** — the entry with the highest ``min_iteration`` ≤ ``n``
+         **overrides the variant**, so a bundle that iterates escalates regardless of its
+         self-reported difficulty (a hard bundle mis-rated "low" can't loop forever on an
+         underpowered executor)."""
+    builder = cfg.builder
+    spec = _explicit_model_variant(d, cfg) or _routed_variant(d, cfg)  # #167 then #134
+    if spec is not None:
+        builder = _leaf_from_spec(spec, cfg.builder)
+    chosen = -1
+    for spec in cfg.builder_escalation:  # escalation OVERRIDES the variant pick (#135)
+        threshold = int(spec.get("min_iteration", 0))
+        if chosen < threshold <= n:
+            chosen = threshold
+            builder = _leaf_from_spec(spec, cfg.builder)
+    return builder
+
+
+def _argv_pinned(argv: list[str], token: str) -> str | None:
+    """The value ``token`` is pinned to in ``argv``, or ``None`` when ``token`` is absent.
+
+    Both spellings a CLI accepts: the separate pair (``["--model", "opus"]``) and the
+    ``=``-joined form (``"--model=opus"``, ``"model_reasoning_effort=low"``). The match
+    on ``token`` is EXACT — equality, or the ``token=`` prefix — never a substring: a
+    family whose model flag is ``-m`` (codex, families.py:103) must not read its model
+    out of an unrelated ``--model-info``-style argument. ``_mapped_argv``'s own dedup
+    probe is deliberately looser (``probe in a``, :161); being strict here only ever
+    costs a fallback to the leaf's key, which is the safe direction to be wrong in."""
+    for i, a in enumerate(argv):
+        if a == token:
+            return argv[i + 1] if i + 1 < len(argv) else ""
+        if a.startswith(token + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _effective_tier(leaf: LeafConfig, profile: families.FamilyProfile) -> tuple[str, str]:
+    """The (model, effort) that will ACTUALLY run ``leaf`` — for telemetry (issue #356).
+
+    Same precedence as :func:`_mapped_argv`, which is what decides what actually reaches
+    the CLI: "explicit argv is the escape hatch and always wins", so a flag already in
+    ``argv`` pins the value and the leaf's ``model`` / ``effort`` key is never added.
+    Reading those keys instead would name the tier that was *requested* — a leaf with
+    opus/high whose argv pins sonnet/low **runs** sonnet/low, and the sidecar exists to
+    calibrate what ran. Neither set ⇒ ``""``: the CLI picks its own default and the
+    harness must not guess it."""
+    model = _argv_pinned(leaf.argv, profile.model_flag) if profile.model_flag else None
+    effort = None
+    if profile.effort_argv:
+        rendered = [a.format(effort=leaf.effort) for a in profile.effort_argv]
+        # The probe _mapped_argv derives (:161), so the two agree on which flag the
+        # family's effort mapping owns: a "--effort"-style flag, or the key of a
+        # "-c key=value" pair. Independent of the effort VALUE, so it resolves an
+        # argv-pinned effort even when the leaf sets no `effort` key at all.
+        probe = rendered[0] if rendered[0].startswith("--") else rendered[-1].split("=", 1)[0]
+        effort = _argv_pinned(leaf.argv, probe)
+    return (leaf.model if model is None else model,
+            leaf.effort if effort is None else effort)
+
+
+def _record_loop_attempt(d: Path, n: int, builder: LeafConfig, cfg: Config) -> None:
+    """Append this Do attempt to ``loop-telemetry.json`` (issue #135) so iterations-to-pass
+    and which backend ran each pass are visible. Loop cost ≈ plan + iterations×review (an
+    iterate re-runs builder *and* the frontier reviewer), so the attempt count is the
+    go/no-go metric for adopting a cheaper local executor. The file persists across
+    iterations (it is not archived), so it accumulates. Best-effort: never break Do.
+
+    ``builder`` / ``family`` alone cannot answer that question for a ladder that climbs
+    within ONE vendor (sonnet/high → opus/xhigh → opus/max — the shape the shipped
+    ``[[leaves.builder_escalation]]`` example suggests): every tier writes the identical
+    ``claude``/``claude`` pair. So the attempt also records the EFFECTIVE model and effort
+    — what will run, after argv precedence, not what was configured (:_effective_tier).
+    ``n`` / ``builder`` / ``family`` keep their shape and meaning (#200 reads ``family``)."""
+    path = d / "loop-telemetry.json"
+    data: dict = {"attempts": []}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            loaded = None
+        # Only adopt a well-shaped prior file; a hand edit / older writer that left a
+        # top-level array (or a non-list `attempts`) must not abort Do via AttributeError —
+        # this sidecar is best-effort. Anything else is replaced with a fresh dict.
+        if isinstance(loaded, dict) and isinstance(loaded.get("attempts"), list):
+            data = loaded
+    label = builder.argv[0] if builder.argv else builder.mode
+    try:
+        model, effort = _effective_tier(builder, cfg.profile(builder))
+    except Exception:  # noqa: BLE001 — e.g. a [families.*] effort_argv carrying an
+        model, effort = "", ""  # unknown placeholder: record nothing, never break Do
+    data["attempts"].append({"n": n, "builder": label, "family": builder.family,
+                             "model": model, "effort": effort})
+    data["iterations_to_pass"] = len(data["attempts"])
+    try:
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def do_build(d: Path, cfg: Config) -> None:
+    # Route the builder FIRST, then dispatch on the SELECTED backend's mode — a variant /
+    # escalation entry may set its own mode, so keying the command-vs-stub decision on
+    # cfg.builder.mode would run a command variant as a stub (or vice versa) (#134).
+    n = attempt_no(d)
+    builder = select_builder(d, cfg, n)  # escalate-on-iterate (#135); difficulty (#134)
+    # Clear a stale tail from a prior attempt before EITHER backend runs — an iterate-do
+    # archives it with its attempt, but a rebuild that didn't archive (a resumed run, a
+    # backend switched to stub) would otherwise leave a log at the top level that describes
+    # a failure this build never had (#280 review).
+    error_log = d / BUILD_ERROR_LOG
+    error_log.unlink(missing_ok=True)
+    (d / BUILD_MEMORY_LOG).unlink(missing_ok=True)  # same staleness rule (#280 review)
+    if builder.mode != "command":
+        _stub_build(d, cfg)
+        return
+    # The capture wraps the WHOLE of Do — its SETUP as well as the leaf invocation. Do can
+    # die before the leaf ever launches, and the most likely way is `worktree.ensure`, which
+    # deliberately raises WorktreeError when the target's base ref doesn't resolve (#235,
+    # fail-closed — it refuses to run Do in the operator's primary checkout). In a wave batch
+    # that is precisely what an unpushed folded base looks like. Wrapping only `_invoke` left
+    # those failures with NO bundle-local trace at all — worse than before, since the stale
+    # log was already cleared above — so a post-mortem was back to terminal scrollback for the
+    # one failure mode most likely to hit a whole wave (#286 review).
+    try:
+        # The lane lock (#296 review) spans ensure + the whole builder invocation, so an
+        # out-of-band gate read can never reconstruct the lane under the builder's feet
+        # (it fails closed "lane busy" instead). Blocking: Do waits out a transient gate.
+        with worktree.lane_lock(d, cfg, wait=True):
+            _do_build_command(d, cfg, builder, n)
+    except Exception as exc:  # noqa: BLE001 — capture, then re-raise for the caller
+        try:
+            # The log was cleared above, so one that exists now was written during THIS Do
+            # — by the retry wrapper, attempt by attempt (#540). Overwriting it with one
+            # record would destroy the post-mortem the retries built (#537). What is left
+            # for this capture is a Do that died AROUND the leaf (`worktree.ensure`, the
+            # lane lock), which otherwise has nothing bundle-local at all.
+            if error_log.exists():
+                print(f"leaves: {d.name} — Do failed; the builder's per-attempt record is "
+                      f"in {BUILD_ERROR_LOG}", file=sys.stderr)
+            else:
+                error_log.write_text(_format_leaf_attempt(exc, 1), encoding="utf-8")
+                print(f"leaves: {d.name} — Do failed; captured the error tail in "
+                      f"{BUILD_ERROR_LOG}", file=sys.stderr)
+        except OSError:
+            pass  # never let error-capture mask the real failure
+        with contextlib.suppress(Exception):  # …nor may the report of what it left
+            _report_failed_do(d)
+        raise
+
+
+def _do_residue(d: Path) -> list[str]:
+    """The Do artifacts actually in bundle ``d``: patch.diff, build-notes.md and the test
+    file(s) the brief names, those that exist. Read only — nothing here deletes them."""
+    names = ["patch.diff", "build-notes.md"]
+    names += [str(t) for t in brief.test_files(d / "brief.md")]
+    return [n for n in dict.fromkeys(names) if (d / n).is_file()]
+
+
+def _report_failed_do(d: Path) -> None:
+    """What a failed Do left in the bundle, and what a plain re-run would do next (#537).
+
+    Printed for EVERY failed Do — transient, substantive or setup — because the honest
+    next action depends on the residue, not on why the builder died. The state is ASKED
+    (:func:`state.state`), never inferred from which files are present: a bundle left
+    holding patch.diff reads BUILT (state.py:347-364), and ``driver.advance`` then runs
+    Check on it, not Do (driver.py:76). Reporting only — nothing here deletes anything.
+    """
+    issue = d.name.removeprefix("issue_")
+    left = _do_residue(d)
+    if left:
+        print(f"leaves: {d.name} — left in the bundle: {', '.join(left)}. That is an "
+              "unfinished attempt's work, not a finished build; nothing deletes it.",
+              file=sys.stderr)
+    else:
+        print(f"leaves: {d.name} — no patch.diff, build-notes.md or brief-named test file "
+              "was left in the bundle.", file=sys.stderr)
+    now = state.state(d)
+    if now == state.BUILT:
+        advice = (f"the bundle now reads {now}, so a plain re-run (`pdca run {issue}`) runs "
+                  "CHECK on that unfinished patch.diff, not Do. To rebuild instead, move "
+                  "patch.diff out of the bundle first.")
+    elif now == state.PLANNED:
+        advice = (f"the bundle still reads {now}, so a plain re-run (`pdca run {issue}`) "
+                  "starts Do again.")
+        if left:
+            advice += (" That builder is NOT told the files above are residue; move them "
+                       "aside first if they should not be built on.")
+    else:
+        advice = f"the bundle reads {now}; `pdca status` shows what a re-run does next."
+    print(f"leaves: {d.name} — next: {advice}", file=sys.stderr)
+
+
+def _do_build_command(d: Path, cfg: Config, builder: LeafConfig, n: int) -> None:
+    """Run Do on a command backend: set up isolation, then invoke the leaf resiliently.
+
+    Every failure here — setup or invocation — still reaches `build.error.log` and is still
+    re-raised, so `flow._isolate` contains it and drops just this bundle: an INVOCATION
+    failure is recorded attempt by attempt by `_invoke_leaf_resilient`, a SETUP failure by
+    the caller's capture.
+    """
+    _record_loop_attempt(d, n, builder, cfg)
+    # Isolate Do in a per-cycle worktree off the base (issue #94) so the host's
+    # primary checkout is never mutated. Best-effort for the cases isolation can't apply
+    # (None ⇒ edit in place); a real checkout whose base ref won't resolve RAISES (#235).
+    wt = worktree.ensure(d, cfg)
+    profile = cfg.profile(builder)
+    if wt and profile.cwd_discovery:
+        # A cwd-discovery family (claude) finds its subagents AND the builder_guard
+        # PreToolUse hook by walking up from its cwd, so cwd MUST stay the harness root
+        # (.claude/agents + .claude/settings live there). Confining its cwd to the
+        # worktree would hide both — `--agent builder` would not resolve and the
+        # STOP-discipline guard would not load. It is grounded in the worktree via
+        # the profile's grounding flag + the prompt instead (as in #94), not by cwd.
+        # (The profile is the SELECTED builder's, so an escalated/variant claude
+        # backend gets this too.)
+        extra = [profile.grounding_flag, str(wt)] if profile.grounding_flag else None
+        workdir, env = cfg.root, {"PDCA_WORKTREE": str(wt)}
+    elif wt:
+        # Other command builders (codex, a local agentic CLI) have no cwd-walking agent
+        # machinery, so CONFINE them by running *in* the worktree (cwd): otherwise the
+        # leaf is launched from the harness root with nothing stopping it from writing
+        # the host checkout or a sibling repo, breaking one-bundle-one-diff (issue #136).
+        # But the builder must ALSO read brief.md and write its artifacts (patch.diff /
+        # the test / build-notes.md) in the BUNDLE dir, which is outside that cwd — and a
+        # sandboxing family (codex `--sandbox workspace-write`) can only write cwd + roots
+        # granted with its grounding flag. So grant the bundle dir as an extra writable
+        # root (#230); a family with no grounding flag (generic) is unsandboxed and reaches
+        # it anyway. cwd stays the worktree, so #136 still confines source edits.
+        workdir, env = wt, {"PDCA_WORKTREE": str(wt)}
+        extra = [profile.grounding_flag, str(d)] if profile.grounding_flag else None
+    else:
+        workdir, env, extra = cfg.root, None, None  # best-effort: edit in place, as before
+    if not profile.native_guard:
+        # A family without its own PreToolUse STOP hook gets the driver's `gh`
+        # PATH shim — the same builder_guard rules, enforced vendor-neutrally.
+        env = guard.shim_env(cfg, env)
+    # The builder runs on the SAME resilient path as the reviewer and both advisories
+    # (#537). It was the one of them still on plain `_invoke`, so no builder failure was
+    # ever retried — on the leaf where an attempt costs the most. The shipped attempt
+    # budget, backoff and transient rule are reused as they are; a substantive failure is
+    # still not retried. `memory_log` is left to the wrapper's `_memory_log_for`
+    # derivation, as at the other three call sites: build.error.log → build.memory.jsonl,
+    # the same file this call used to name explicitly (#420 unchanged).
+    #
+    # Attempt 1 is sent exactly today's prompt, built here as before. A retry is told its
+    # predecessor died mid-flight and that anything it finds is that attempt's residue
+    # (`_build_prompt(dead_attempts=…)`) — `worktree.ensure` ran once, above, so the
+    # worktree and the bundle still hold whatever the dead attempt left. `spent` counts
+    # the attempts actually spawned (the wrapper asks for attempt N's prompt right before
+    # spawning it), which is what the failure report names — not the budget.
+    first = _build_prompt(d, cfg, worktree_root=wt)
+    spent = 0
+
+    def prompt_for(attempt: int) -> str:
+        nonlocal spent
+        spent = attempt
+        if attempt == 1:
+            return first
+        return _build_prompt(d, cfg, worktree_root=wt, dead_attempts=attempt - 1)
+
+    try:
+        # Watch the bundle d so the heartbeat shows patch.diff / build-notes.md appearing.
+        err = _invoke_leaf_resilient(
+            builder, workdir, prompt_for,
+            error_log=d / BUILD_ERROR_LOG,
+            label=f"Do {d.name}",
+            status=lambda: progress.bundle_activity(d, ("patch.diff", "build-notes.md")),
+            stream_json=True,  # Tier 3: show the builder's live tool-use
+            env=env, extra_argv=extra, cfg=cfg,
+        )
+    except OSError as unwritable:
+        # The bundle could not hold the builder's settled record. The wrapper raises that
+        # write's OSError FROM the builder's own failure; Do's contract is that the
+        # builder's failure — not the bookkeeping about it — reaches the flow (#286).
+        err = unwritable.__cause__
+        if err is None:
+            raise
+        print(f"leaves: {d.name} — could not write {BUILD_ERROR_LOG} ({unwritable})",
+              file=sys.stderr)
+    if err is None:
+        return
+    if getattr(err, "transient", False):
+        print(f"leaves: {d.name} — transient: the builder leaf exited "
+              f"{getattr(err, 'returncode', '?')} on transient infra (before emitting any "
+              "work, or on its own report of a transient API error), the class of "
+              "failure the harness retries to absorb; not absorbed after "
+              f"{spent} attempt(s).", file=sys.stderr)
+    raise err
+
+
+def _build_prompt(d: Path, cfg: Config | None = None, *,
+                  worktree_root: Path | None = None, dead_attempts: int = 0) -> str:
+    # `dead_attempts` (#537) — how many earlier attempts of THIS Do's builder died before
+    # this one was spawned. 0 (every caller but a retry) adds nothing, so the prompt is
+    # byte-identical; otherwise the retry notice sits between the task and the rubric.
+    # The target repo's standing rubric (#314), so the builder self-reviews against
+    # the same criteria the reviewer will apply — the asymmetry that costs a
+    # guaranteed round. "" when unconfigured, so the prompt is byte-identical.
+    # APPENDED, not prepended (#314 review): prefixing glued the rubric's last rule
+    # straight onto "You are the Do builder…" with no separator, merging the two
+    # instructions. The task prompt also reads better first — the rubric is a standing
+    # constraint on the work, not the framing for it.
+    # `worktree_root` is what `worktree.ensure` ACTUALLY returned — None when setup failed
+    # and `_do_build_command` fell back to running in place. Passing it explicitly is the
+    # only way the rubric lookup can tell "this lane is mine and live" from "this lane is
+    # mine and stale": a failed ensure() leaves the directory and its owner stamp behind,
+    # so an ownership check alone would still prefer a tree the builder is not editing.
+    rubric = (rubric_mod.for_builder(d, cfg, worktree_root=worktree_root)
+              if cfg is not None else "")
+    return (
+        f"You are the Do builder. Read {d}/brief.md. If $PDCA_WORKTREE is set, make ALL "
+        "target-source edits there — it is an isolated git worktree off the target's base "
+        "(the host's primary checkout is NOT touched); cite path:line against it. Build to "
+        "satisfy the brief's **Success "
+        "criterion** (the real end result), not a narrower proxy — an item is done only "
+        "when that end result holds, proven red→green; a green mechanical check on "
+        "something adjacent is not done. If brief.md names a **Planning artifact** (an "
+        "ADR / proposal / spec), READ that document — it is the authoritative plan and the "
+        "brief only points at it; build to it and cite it. If brief.md carries an '## Iteration N — "
+        "carry-forward' block, address it (the previous attempt's rationale + failing "
+        "gate) and do NOT repeat the rejected approach. Produce, in the bundle directory "
+        f"{d}: (1) patch.diff — a unified diff against the brief's target branch; "
+        "(2) the test file the brief names, red before the fix and green after; "
+        "(3) build-notes.md — your rationale (withheld from the reviewer). Cite "
+        "path:line on the target branch for every change. To run the test red→green, "
+        "use the project's own test runner (it provides a timeout and whatever "
+        "environment it is configured for); do NOT hand-roll your own runner command "
+        "(a raw container or ad-hoc test invocation) — it has no timeout and can hang "
+        "forever, stalling the cycle. "
+        "Do NOT assume the runner gives you a display / GUI / other rich runtime: if it "
+        "is headless, a test that imports a heavy module (a GUI toolkit, etc.) AT LOAD "
+        "can crash it (and recur every iterate-do) — keep the unit under test "
+        "import-light by extracting the logic into an import-free module and testing "
+        "that, which must still drive the PRODUCTION code, not a copy. If the behaviour "
+        "is IRREDUCIBLY GUI/display/IO-bound and no honest headless test can exercise "
+        "production, do NOT fabricate a stand-in / mock / parallel re-implementation that "
+        "passes vacuously — ship patch.diff, explain in build-notes WHY it isn't "
+        "headless-testable plus concrete manual-validation steps, and ship NO test rather "
+        "than a fake one (the honest 'unverifiable' result surfaces a NEEDS-HUMAN item in "
+        "§6 for the human to validate at sign-off). Make the patch commit-ready for the "
+        "TARGET repo: run the project's "
+        "configured formatter / commit hooks before declaring done — the publish commit "
+        "runs the target's own hooks (formatter/linters), which no PDCA gate models, so a patch the target's "
+        "commit hook would reject is not done even if every gate is green. Do NOT push, "
+        "open, or mark any PR ready."
+    ) + (_retry_notice(d, dead_attempts, worktree_root) if dead_attempts else "") + rubric
+
+
+def _retry_notice(d: Path, dead_attempts: int, worktree_root: Path | None) -> str:
+    """What a RETRIED builder is told about the attempt(s) that died before it (#537).
+
+    `worktree.ensure` runs once per Do, before the retry wrapper, so a retry opens the
+    same worktree and bundle its predecessor was working in. Unwarned, it can read a
+    partial patch.diff / build-notes.md / test file there as a finished build and exit 0,
+    and a half-written attempt is then reported as the leaf's success. Every sentence is
+    true of the disk as it is when the retry is spawned: Do only starts from PLANNED
+    (driver.py:69-75), i.e. with no patch.diff (state.py:347), so nothing of this kind in
+    the bundle came from a finished build — though a build-notes.md or test file may be an
+    earlier failed Do's, so the notice does not name WHICH attempt left it; and the pointer
+    at the error log is given only when the per-attempt record (#540) is there to read.
+    """
+    record = d / BUILD_ERROR_LOG
+    log = (f" The harness's record of how it died (exit status and captured stderr tail) "
+           f"is in {record}." if record.is_file() else "")
+    edits = ("any change already in the worktree ($PDCA_WORKTREE) — it is NOT reset "
+             "between attempts" if worktree_root is not None else
+             "any source edit already made in place")
+    before = "attempt" if dead_attempts == 1 else f"{dead_attempts} attempts"
+    return (
+        f"\n\nRETRY NOTICE — this is attempt {dead_attempts + 1} of this Do's builder leaf. "
+        f"The previous {before} died MID-FLIGHT (exited non-zero); the work was NOT "
+        f"finished.{log} Any patch.diff, build-notes.md or test file you find in {d}, and "
+        f"{edits}, is INCOMPLETE RESIDUE of an attempt that did not finish: verify it "
+        "against the brief's Success criterion and complete or replace it. Never treat any "
+        "of it as evidence the work is done, and re-run the test red→green yourself rather "
+        "than trust a result you did not observe."
+    )
+
+
+def _stub_build(d: Path, cfg: Config) -> None:
+    test_rel = (brief.test_files(d / "brief.md") or [Path("test_stub.py")])[0]
+    test_path = d / test_rel
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text(
+        "# Stub regression test shipped by the Do leaf (vertical slice).\n"
+        "def test_placeholder():\n    assert True\n",
+        encoding="utf-8",
+    )
+    (d / "patch.diff").write_text(
+        "# Stub patch produced by the Do leaf for the vertical slice.\n"
+        "# A real builder writes a unified diff here.\n"
+        f"# (the shipped test is {test_rel})\n",
+        encoding="utf-8",
+    )
+    (d / "build-notes.md").write_text(
+        "# Build notes (builder rationale — withheld from the reviewer)\n\n"
+        "Stub Do leaf. A real builder records here why this change, what was\n"
+        "tried, and what was ruled out. The reviewer never sees this file.\n",
+        encoding="utf-8",
+    )
+
+
+# What every harness-authored reviewer / advisory prompt tells its leaf to end with (#541).
+# One instruction, one spelling, three prompts. The trailer is the leaf's own statement that
+# it finished the file: `assemble.leaf_status` looks for it as the artifact's last non-blank
+# line, and an artifact that ends with it is read as a real verdict whatever its body quotes.
+# Its absence changes nothing. An artifact without it (a leaf that ignores this, or a
+# third-party leaf that never saw this prompt) is classified exactly as it was before the
+# trailer existed, and whether an artifact is filed at all never depends on it: keeping a dead
+# attempt's leftover file out of the bundle is `_LeafHarvest`'s ownership check, which does
+# not read the trailer. So the instruction says only what the trailer does. It must not
+# threaten a cost for leaving it off — there is none, and a leaf told that a report without
+# the trailer is not read as its verdict could leave it off on purpose, to hold a report back.
+# Instructed rather than stamped by the harness after the fact, deliberately: only the writer
+# can say it finished, and a stamp applied to whatever is at the path would re-assert exactly
+# the assumption #541 removed.
+#
+# Appended LAST, as its own paragraph, at the point each prompt is composed — after the
+# project rubric where the leaf gets one — so it is the final thing the leaf reads. An
+# instruction that says "nothing may follow it" must not itself be followed by more prompt.
+_COMPLETION_INSTRUCTION = (
+    "\n\nWhen {artifact} is complete, end it with this exact line, on its own, as the very last "
+    f"line of the file: {assemble.LEAF_COMPLETE_TRAILER} — it tells the harness this file is "
+    "your finished report. Nothing may follow it."
+)
+
+
+# ----------------------------------------------------------------------------
+# Leaf 2 — Check reviewer (headless, decorrelated, advisory): check-review.md.
+# ----------------------------------------------------------------------------
+def reviewer_input_paths(d: Path) -> list[Path]:
+    """The exact files the reviewer receives — build-notes.md is not among them."""
+    return [d / name for name in REVIEWER_INPUTS]
+
+
+_REVIEW_PROMPT = (
+    "You are the Check reviewer — advisory, artifact-only, decorrelated from the "
+    "builder. You have ONLY patch.diff, brief.md, check-gates.json and the round's "
+    "frozen gate evidence in gate-logs/ in this directory (build-notes.md is "
+    "deliberately withheld). A check-gates.json row's `log` key names its "
+    "gate-logs/<rule_id>.log — the gate's FULL captured output plus a header giving the "
+    "exact cmd, cwd and PDCA_WORKTREE it ran under. When you cannot re-run a gate "
+    "yourself — the wrappers named in `oracle` are instance-root/$PDCA_WORKTREE-scoped "
+    "and are NOT runnable from $PDCA_TARGET — READ THAT LOG and adjudicate the row from "
+    "it; the oracle being absent from the target checkout is expected and is not by "
+    "itself a finding. Reserve the 'gate not reproducible / oracle missing' NEEDS-HUMAN "
+    "for a row that has NO log (no `log` key, a `log_error`, or a file that is not "
+    "there). A row whose `result` is `deferred` is NOT a green to reproduce and NOT a "
+    "finding: the gate ran, found its subject absent BY DESIGN (the artifacts it audits "
+    "are drafted later), and its substantive verdict is owed to a gate that re-runs it at "
+    "publish — the row's evidence line says which. Record it `N/A` with that reason and do "
+    "NOT escalate it to NEEDS-HUMAN. Write check-review.md: open it "
+    "with a one-line outline of the task under review (the bug to fix / functionality to "
+    "implement), then a complete verdict table — one row for EVERY element of the "
+    "5/5/1 matrix, in order:\n"
+    # Bare labels, no `{elem} — ` prefix: the Item cell is matched exactly against the label
+    # (#408), and a listed prefix is what reviewers copied into it.
+    + "\n".join(f"  {label}" for _elem, label, _kind, _oracle in gates.canonical_elements())
+    + "\nFormat it as a Markdown table `| Item | Verdict | Basis |`, the Item column "
+    "carrying the element label EXACTLY as listed above (no element-id prefix, no added "
+    "words), the Verdict one of PASS / FAIL / NEEDS-HUMAN / "
+    "N/A, the Basis a one-line reason you re-derived yourself (cite path:line where "
+    "you can) — state the DECISION OWED (the context + impact the verdict turns on, "
+    "what the human must decide and why), not a restatement of the implementation, "
+    "especially for NEEDS-HUMAN rows. Emit NEEDS-HUMAN for the always-human items (validation "
+    "fitness-to-purpose, contested root-cause, ambiguous scope) — each NEEDS-HUMAN "
+    "row becomes a §6 item the human must clear. On the "
+    + " and ".join(f"'{label}'" for elem, label, _kind, _oracle in gates.canonical_elements()
+                   if elem in assemble._PROMOTABLE_ELEMENTS)
+    + " rows ONLY, when your NEEDS-HUMAN concern is an IMPLEMENTATION defect the builder "
+    "can fix by iterating (a logic bug, a missed case, a weak or incorrect test), write the "
+    "Verdict `NEEDS-HUMAN [impl]` so the driver routes it straight back to Do; keep plain "
+    "`NEEDS-HUMAN` there for a concern that needs a human decision (scope, root cause, "
+    "fitness-to-purpose). Never tag any other row `[impl]` — it is ignored there. Do not "
+    "omit a row; use N/A with a "
+    "reason when an element does not apply. For a visual / manual-repro NEEDS-HUMAN row, "
+    "verify what you can yourself — where feasible, exercise the change with the patch "
+    "applied at $PDCA_TARGET (run the relevant test, or start/drive the app if the runner "
+    "allows), observe, and report; only where it genuinely can't be driven, hand the human "
+    "concrete runnable steps, not a bare 'needs manual check'. If a verdict turns on an "
+    "investigation, run it and show the result directly — don't ask whether to investigate. "
+    "Ground every cited path:line on the target source at $PDCA_TARGET. When the bundle "
+    "carries a patch, $PDCA_TARGET is a DISPOSABLE git-self-contained copy — the base as "
+    "one local commit, patch.diff applied uncommitted on top — so the independent "
+    "red→green re-run is executable in place: `git stash` restores the pre-fix tree, "
+    "`git stash pop` re-applies the patch, and no write of yours can reach the real "
+    "checkout. Otherwise treat $PDCA_TARGET as read-only. "
+    "if $PDCA_TARGET is unset, ground against patch.diff alone — do NOT search other "
+    "checkouts on the machine. If $PDCA_TARGET is SET yet stale or unreadable (its base "
+    "lags what the patch was built/verified against — a dependent/stacked cycle's base "
+    "routinely trails its prerequisite until it merges), that is a target-state caveat, "
+    "NOT a patch defect: note the staleness and ground the affected citations on "
+    "patch.diff. Do NOT present a stale- or unreadable-target 'patch cannot apply / does "
+    "not compile' as a blocking C4 (verification) FAIL — that fabricates an ordering-gate "
+    "blocker for a patch that is in fact correct."
+)
+
+
+def _reviewer_target(d: Path, cfg: Config) -> Path | None:
+    """The local target checkout the reviewer grounds its citations on, or None (#75/#120).
+
+    Prefer the per-cycle **worktree** (#94): it is fetched + pinned to
+    ``<base_remote>/<base>`` and carries the patch, so the reviewer grounds on the *same*
+    base the gates ran against — not the human's sibling working checkout, which can lag
+    ``origin/<base>`` (a false "patch cannot apply" C4) or be sandbox-unreadable (#120).
+
+    When no worktree exists (isolation off / non-git target), fall back to the resolved
+    sibling checkout — but first ``git fetch`` it so grounding sees the current base. The
+    fetch is **non-destructive** (refs only): never ``reset``/``checkout`` the human's
+    working tree. Best-effort: any failure yields None and the reviewer grounds on the diff.
+    """
+    wt = worktree.path(d, cfg)
+    if wt is not None:
+        return wt
+    from . import publish  # lazy: publish imports leaves, avoid an import cycle
+    try:
+        repo_spec, _base, _slug = publish._resolve_target(d)
+        if not repo_spec:
+            return None
+        p = publish._checkout_path(cfg, repo_spec)
+        if not p.exists():
+            return None
+        # Refresh refs so a lagging sibling doesn't drift the reviewer's grounding; do NOT
+        # touch the working tree (it is the human's checkout). Best-effort.
+        subprocess.run(["git", "-C", str(p), "fetch", cfg.base_remote],
+                       capture_output=True, text=True)
+        return p
+    except Exception:  # noqa: BLE001 — grounding access is best-effort, never fatal
+        return None
+
+
+def _reviewer_repo(d: Path, target: Path, sandbox: Path) -> Path | None:
+    """A DISPOSABLE, git-self-contained copy of ``target`` inside the reviewer sandbox —
+    the tree the reviewer may re-run the red→green on (issue #419).
+
+    The review contract asks the reviewer to independently re-verify C4 against
+    ``$PDCA_TARGET``: restore the pre-fix state, run the bundle's test, re-apply
+    (``git stash`` / ``git stash pop``). The tree :func:`_reviewer_target` resolves cannot
+    host that inside the reviewer's confinement: a linked worktree's git metadata — its
+    index included — lives under the PRIMARY checkout's ``.git/worktrees/<name>/``
+    (its ``.git`` is an absolute pointer, ``worktree.py:14-16``), and stash writes objects
+    into the shared ``.git/objects`` — both outside the granted dir and read-only to the
+    leaf. So every index-writing git op failed and the C4 verification claim landed in §6
+    NEEDS-HUMAN on every cycle instead of being mechanically re-checked.
+
+    Shape: ``<sandbox>/target`` holding the target's base tree as ONE local commit with
+    the bundle's ``patch.diff`` applied UNCOMMITTED on top — exactly the state the
+    reviewer must stash away, and the state the lane worktree itself carries (base
+    checked out, patch applied uncommitted), so ``HEAD`` of the source IS the pre-fix
+    tree. The copy's whole ``.git`` lives inside the sandbox cwd, so the pre-fix restore
+    + re-apply write nothing anywhere near the primary checkout's git metadata; the
+    source repo is only ever READ (``git archive`` / ``rev-parse``). Identity and signing
+    are pinned in the copy's local config so ``git stash`` (which commits) cannot depend
+    on the operator's global git config.
+
+    Only for a bundle WITH a patch: with nothing to stash there is no re-run, and
+    read-only grounding on the real checkout serves citations better (full history).
+    **Best-effort**, mirroring :func:`_seed_sandbox_gate_logs`: any failure — a non-git
+    target, an archive/extract/apply error — degrades to None with a stderr note and the
+    caller falls back to grounding on ``target`` directly; never an aborted Check.
+    """
+    patch = d / "patch.diff"
+    try:
+        patch_text = patch.read_text(encoding="utf-8") if patch.is_file() else ""
+    except (OSError, UnicodeDecodeError):
+        patch_text = ""
+    if not patch_text.strip() or not (target / ".git").exists():
+        return None
+    dest = sandbox / "target"
+
+    def _run(repo: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+
+    try:
+        # READ-ONLY against the source: export the tree at HEAD (the pre-fix base — the
+        # patch sits uncommitted on top of it in the lane) without touching its index.
+        archive = _run(target, "archive", "--format=tar", "HEAD")
+        if archive.returncode != 0:
+            raise OSError(archive.stderr.decode(errors="replace").strip()
+                          or "git archive failed")
+        base = _run(target, "rev-parse", "HEAD").stdout.decode(errors="replace").strip()
+        dest.mkdir()
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
+            try:
+                tf.extractall(dest, filter="data")
+            except TypeError:  # Python 3.11.0–3.11.3: no filter= yet (PEP 706 backport)
+                tf.extractall(dest)
+        for args in (("init", "-q"),
+                     # stash COMMITS: pin identity + signing in the copy's own config so
+                     # the re-run cannot depend on the operator's global git config.
+                     ("config", "user.name", "pdca-reviewer"),
+                     ("config", "user.email", "pdca-reviewer@localhost"),
+                     ("config", "commit.gpgsign", "false"),
+                     # -f: a tracked-but-gitignored file in the base must not drop out.
+                     ("add", "-A", "-f"),
+                     ("commit", "-q", "--allow-empty", "-m", f"pre-fix base {base}"),
+                     ("apply", str(patch.resolve()))):
+            done = _run(dest, *args)
+            if done.returncode != 0:
+                raise OSError(
+                    f"git {args[0]}: {done.stderr.decode(errors='replace').strip()}")
+        return dest
+    except Exception as exc:  # noqa: BLE001 — materialization is best-effort, never fatal
+        print(f"leaves: could not materialize a git-writable reviewer copy of {target} "
+              f"({exc}); the leaf grounds on the target read-only and the red→green "
+              "re-run may land in §6", file=sys.stderr)
+        shutil.rmtree(dest, ignore_errors=True)
+        return None
+
+
+def run_review(d: Path, cfg: Config) -> None:
+    inputs = reviewer_input_paths(d)
+    assert (d / "build-notes.md") not in inputs, "independence contract violated"
+
+    if cfg.reviewer.mode == "command":
+        _run_review_sandboxed(d, cfg)
+        return
+    _stub_review(d, cfg)
+
+
+def review_never_ran(d: Path) -> bool:
+    """True iff the reviewer leaf left no settled account of this Check round (#369/#540).
+
+    ``state.leaf_ran_and_failed`` is the engine's failed-leaf discriminator (#138): a
+    reviewer that ran and SPENT its attempts left a settled ``state.REVIEW_ERROR_LOG``
+    (and a §6 placeholder review); a successful run removed any stale log. So no
+    check-review.md and no *settled* log means the reviewer never finished — either it
+    never started (the beat died in the window between the gate write and the leaf) or a
+    death inside its retry loop left an unfinished record (#540). Both are "not yet run",
+    never "ran and failed", and the leaf is safe (and necessary) to run now: the
+    alternative is a bundle reaching sign-off with no review of the diff at all.
+    """
+    return (not (d / "check-review.md").exists()
+            and not state.leaf_ran_and_failed(d / state.REVIEW_ERROR_LOG))
+
+
+def _seed_sandbox_agents(cfg: Config, sandbox: Path) -> None:
+    """Copy the project's ``.claude/agents`` into the sandbox so a leaf running there can
+    resolve ``--agent <name>`` (issue #161).
+
+    Claude Code (>= 2.1.x) discovers project subagents by walking **up from the subprocess
+    cwd**. The reviewer/advisory leaves run in a temp sandbox cwd (the independence
+    contract below), which has no ``.claude/agents`` above it — so ``--agent reviewer``
+    fails and the review degrades to a §6 placeholder. Seeding the agent *definitions* into
+    the sandbox makes them resolvable while **preserving independence**: only the role
+    prompts are copied (never ``build-notes.md``), and the sandbox cwd + each agent's own
+    ``tools:`` still gate which files the leaf can read. **Best-effort**: a missing agents
+    dir, or a copy error (a dangling symlink / unreadable file under ``.claude/agents``),
+    degrades to a no-op — an unresolved ``--agent`` is then handled by the leaf's own
+    failure path (a §6 placeholder), never an aborted Check (issue #161 review).
+    """
+    src = cfg.root / ".claude" / "agents"
+    if not src.is_dir():
+        return
+    try:
+        # ignore_dangling_symlinks: a broken link doesn't stop the good agents seeding; the
+        # try/except: any other copy error degrades to a no-op rather than aborting Check.
+        shutil.copytree(src, sandbox / ".claude" / "agents",
+                        dirs_exist_ok=True, ignore_dangling_symlinks=True)
+    except (shutil.Error, OSError) as exc:
+        print(f"leaves: could not seed sandbox agents from {src} ({exc}); "
+              "`--agent` may not resolve", file=sys.stderr)
+
+
+def _seed_sandbox_gate_logs(d: Path, sandbox: Path) -> None:
+    """Copy the round's ``gate-logs/`` into the sandbox so every path a frozen
+    ``check-gates.json`` row references resolves from the leaf's cwd (issue #403).
+
+    Since #370/#415 each gate row carries ``row["log"] = "gate-logs/<rule_id>.log"``
+    (``gates.py:544``) — the full captured output plus a header naming ``cmd``, ``cwd``
+    and ``PDCA_WORKTREE`` (``gates.py:576-593``) — and #370's promise is that "the
+    verdict's whole basis … must be reconstructable from bundle files alone"
+    (``gates.py:535-537``). The reviewer/advisory leaves run in a temp sandbox cwd
+    seeded from :data:`REVIEWER_INPUTS`, a list of **file names**, so the directory was
+    left behind and the one artifact that lets a leaf adjudicate a row it cannot re-run
+    (the wrappers are instance-root/``$PDCA_WORKTREE``-scoped, not runnable from
+    ``$PDCA_TARGET``) was referenced by a path that did not resolve.
+
+    Independence is untouched: a gate log is the *gate's* own output, never the
+    builder's rationale — ``build-notes.md`` stays out of the sandbox.
+
+    **Best-effort**, mirroring :func:`_seed_sandbox_agents`: no ``gate-logs/`` (a stub
+    gate run, an older bundle) or a copy error degrades to a no-op with a stderr note —
+    the leaf then behaves exactly as it did before this seed existed. An OSError must
+    never abort Check.
+    """
+    src = d / state.GATE_LOGS_DIR
+    if not src.is_dir():
+        return
+    try:
+        shutil.copytree(src, sandbox / state.GATE_LOGS_DIR,
+                        dirs_exist_ok=True, ignore_dangling_symlinks=True)
+    except (shutil.Error, OSError) as exc:
+        print(f"leaves: could not seed sandbox gate evidence from {src} ({exc}); "
+              f"`{state.GATE_LOGS_DIR}/` paths in check-gates.json will not resolve",
+              file=sys.stderr)
+
+
+# The ONLY `sandbox.network` keys the driver will carry into a leaf's temp cwd, each with the
+# value shape that counts as a real grant (issues #261, #277). An allow-list, not a copy: a
+# key absent from here — above all `sandbox.excludedCommands`, which makes a command bypass
+# the sandbox entirely — is never seeded, however an instance configures it. A grant whose
+# value fails its filter (an empty domain list, a non-boolean) seeds nothing, which is how a
+# knob ships documented-but-OFF.
+_SEEDED_NETWORK_KEYS = {
+    "allowLocalBinding": lambda v: isinstance(v, bool),                    # #261 loopback bind
+    "allowedDomains": lambda v: isinstance(v, list) and bool(v),           # #277 e.g. github
+    "deniedDomains": lambda v: isinstance(v, list) and bool(v),            # its counterpart
+}
+
+
+def _sandbox_argv(cfg: Config, profile: families.FamilyProfile, *,
+                  seeded: bool) -> list[str]:
+    """Every sandbox flag this leaf's family needs, for the grants the instance opted into.
+
+    ``seeded`` gates ONLY the claude confinement flag, never the codex network grant. The
+    two depend on entirely different things, and conflating them breaks one of them:
+
+    * the confinement flag (:func:`_settings_scope_argv`) is meaningless AND DANGEROUS
+      without the seeded settings file on disk — it drops the operator's ambient sandbox in
+      favour of a project scope that does not exist, leaving the leaf wholly unconfined
+      (#290). A failed seed therefore withholds it: fail closed.
+    * the codex network grant rides on ``argv``, and codex never reads that file at all, so
+      a failed write says nothing about it. Gating it on ``seeded`` would silently kill a
+      codex leaf's Docker access because of a claude-shaped failure it has no stake in.
+
+    Two grants, two shapes, because the vendors' sandboxes differ and neither is strictly
+    tighter (#291) — so they are separate opt-ins, each named for what it actually does:
+
+    * ``[leaves.sandbox] unsandboxed_commands`` (claude) — a NAMED command leaves the sandbox
+      entirely; every other command stays confined. Realized by the seeded ``excludedCommands``
+      + the confinement flags from :func:`_settings_scope_argv`.
+    * ``[leaves.sandbox] network_access`` (codex) — ``--sandbox workspace-write`` has no
+      per-command escape, and its docker-socket denial is **seccomp, not filesystem** (a relayed
+      socket in a granted writable dir is still refused), so only opening the network layer
+      works. That frees the socket/network layer for EVERY command in the leaf, while the
+      filesystem stays confined for every command. It cannot be scoped to one command, which is
+      exactly why it does not ride on ``unsandboxed_commands`` — that key promises "only these
+      commands leave the sandbox", and this would not keep the promise.
+
+    claude deliberately takes no ``network_argv``: it scopes network by DOMAIN instead
+    (``allowedDomains``, #277), which is strictly better where it exists.
+    """
+    argv = _settings_scope_argv(cfg, profile) if seeded else []
+    if cfg.leaf_network_access and profile.network_argv:
+        argv += list(profile.network_argv)
+    return argv
+
+
+def _settings_scope_argv(cfg: Config, profile: families.FamilyProfile) -> list[str]:
+    """Flags confining the leaf to the settings the harness SEEDS — nothing of the operator's.
+
+    Only when an exemption is granted, and only for a family that has such a flag (claude:
+    ``--setting-sources project``). Without it the seeded ``sandbox.excludedCommands`` is a
+    floor rather than a ceiling: array settings CONCATENATE across scopes and the union is
+    monotonic, so the operator's own ``~/.claude/settings.json`` exemptions merge into the
+    leaf and nothing can remove them (PR #288 review). Dropping the user scope also stops the
+    operator's ``permissions`` and ``allowedDomains`` riding in the same way.
+
+    The cost is that the leaf no longer sees user-scope settings at all, so an instance whose
+    **auth** lives there (``apiKeyHelper``, ``env.ANTHROPIC_API_KEY``) must move it into the
+    environment. That fails loudly at leaf start — and now lands in ``check-*.error.log``.
+    """
+    if cfg.leaf_unsandboxed_commands and profile.settings_scope_argv:
+        return list(profile.settings_scope_argv)
+    return []
+
+
+def _seed_sandbox_settings(cfg: Config, sandbox: Path,
+                           profile: families.FamilyProfile) -> bool:
+    """Carry the sandbox capabilities a Check needs into the leaf sandbox (#261, #277).
+
+    Claude Code loads **project** settings from ``.claude/settings.json`` relative to the
+    subprocess cwd — the same walk-up that finds ``.claude/agents`` (#161). The reviewer /
+    advisory leaves run in a temp cwd, so the rendered project's ``.claude/settings.json``
+    is invisible to them and its ``sandbox`` policy silently does not apply. Two capabilities
+    a Check legitimately needs are denied as a result:
+
+    * ``network.allowLocalBinding`` (#261) — without it the leaf's Bash tool runs under
+      Claude Code's bubblewrap+seccomp sandbox where ``TcpListener::bind("127.0.0.1:0")``
+      fails ``Operation not permitted``, so every loopback-socket runtime test panics before
+      its assertion and C2/C4/T3 can only ever be *provisional*.
+    * ``network.allowedDomains`` (#277) — the reviewer's prior-art check needs the
+      closed/rejected-PR corpus (``gh pr list --state closed`` → api.github.com). Blocked, it
+      cannot be settled mechanically and is forced NEEDS-HUMAN on *every* bundle.
+
+    Separately, a **Docker-backed conformance gate** (a live etcd/TiKV/FDB cluster via
+    ``docker compose``) is denied the docker socket inside the sandbox even on a Docker-capable
+    host, so its runtime evidence can never be earned at Check and always defers to a
+    human-run confirmer — the process gets burdensome exactly where it should be mechanical
+    (#276). The fix is NOT a socket-wide grant (``allowAllUnixSockets`` would hand *every*
+    Bash line the leaf writes access to *every* unix socket — and a root-owned docker daemon
+    is root-adjacent). It is a **named-command exemption**: ``[leaves.sandbox]
+    unsandboxed_commands`` in pdca.toml lists the conformance commands, and only those run
+    outside the sandbox. Everything else the leaf does stays confined — which holds only
+    because the exemption ships with ``allowUnsandboxedCommands: false`` beside it; the list
+    is a *ceiling*, not a floor (see below).
+
+    That list is **harness-owned on purpose**. This function never copies the project's own
+    ``sandbox.excludedCommands`` — that is the operator's *gate* workaround, and inheriting it
+    would let the leaf run whatever the operator exempted for CI (PR #268). A leaf's exemption
+    is declared once, deliberately, in pdca.toml.
+
+    **Seeded through an ALLOW-LIST of individual keys** (:data:`_SEEDED_NETWORK_KEYS`), never
+    by copying the ``sandbox`` block, and never ``permissions``. Each wider copy would hand
+    the leaf a capability its ``tools:`` frontmatter does not grant: ``permissions.allow``
+    carries ``Edit``/``Write``, and ``sandbox.excludedCommands`` — which docs 05 recommends to
+    a project as the workaround for its *gates* — makes the named command bypass the sandbox
+    **entirely**, so a reviewer could run the test runner unconfined (PR #268 review). Widening
+    the seed means adding a key here, deliberately — not loosening the copy.
+
+    Each key is **value-filtered**, so a present-but-empty grant seeds nothing: that is how a
+    grant stays OFF by default (the shipped ``allowedDomains: []`` documents the knob without
+    enabling it). Nothing granted at all ⇒ no file written, so an instance that configures no
+    sandbox is unaffected.
+
+    The two sources are **independent**. The network grants are the project's, read from its
+    ``.claude/settings.json`` best-effort; the command exemptions are the harness's, read from
+    ``pdca.toml``. An absent or unparseable settings file costs the network grant and nothing
+    else — it must never suppress a pdca.toml exemption (PR #288 review). Best-effort
+    throughout, like the agent seeding: any read/parse/write error degrades to a no-op, never
+    an aborted Check.
+
+    Scope: this covers the reviewer / advisory **leaves**. Gate commands are plain
+    subprocesses of ``pdca`` and inherit the operator's ambient sandbox instead (docs 05).
+    The **codex** family sandbox (``codex exec --sandbox workspace-write``) is not configured by
+    this file at all — it reads none of it. Its grants ride on ``argv`` instead: ``[leaves.sandbox]
+    network_access`` opens its socket/network layer, which is the only thing that reaches the
+    docker socket *or* api.github.com there (#291, :func:`_sandbox_argv`).
+    """
+    src = cfg.root / ".claude" / "settings.json"
+    granted: dict = {}
+
+    # The NETWORK grants are the project's (claude reads them from its own settings.json), so
+    # they are read from there — best-effort. An absent or unparseable file means no network
+    # grant, and nothing more: it must not suppress the harness-owned exemptions below.
+    if src.is_file():
+        try:
+            settings = json.loads(src.read_text(encoding="utf-8"))
+            network = (settings.get("sandbox") or {}).get("network") or {}
+            net_granted = {key: network[key] for key, valid in _SEEDED_NETWORK_KEYS.items()
+                           if key in network and valid(network[key])}
+            if net_granted:
+                granted["network"] = net_granted
+        except (OSError, ValueError, AttributeError, TypeError) as exc:
+            print(f"leaves: could not read sandbox settings from {src} ({exc}); the leaf gets "
+                  "no network grant", file=sys.stderr)
+
+    # A leaf's sandbox EXEMPTIONS are HARNESS-owned — `[leaves.sandbox] unsandboxed_commands`
+    # in pdca.toml (#276) — and NEVER this settings file's own ``excludedCommands``, which is
+    # the operator's *gate* workaround and must not be inherited by a leaf (#268). Because
+    # they are the harness's, they must not depend on the project having (or being able to
+    # parse) a `.claude/settings.json` AT ALL: gating them on that made the documented Docker
+    # exemption silently do nothing for an instance without one (PR #288 review).
+    #
+    # An exemption LIST alone does not bound what escapes the sandbox. TWO holes, and BOTH
+    # must be closed or "only these commands run outside the sandbox" — the promise made in
+    # this docstring, in docs 05 and in pdca.toml — is not true (PR #288 review):
+    #
+    # 1. `allowUnsandboxedCommands` defaults to TRUE (settings schema, v2.1.207:
+    #    `sandbox?.allowUnsandboxedCommands ?? true`), and while true the model may retry ANY
+    #    sandbox-denied command with the `dangerouslyDisableSandbox` parameter and have it run
+    #    unconfined. False makes that parameter "completely ignored" (the schema's own words).
+    #    It is a SCALAR, so the seeded project scope genuinely overrides the operator's.
+    # 2. Array-valued settings CONCATENATE across scopes (user → project → local → managed):
+    #    the CLI folds each scope through a merge customizer that unions any two arrays, and
+    #    that union is MONOTONIC — no scope, not even managed policy, can remove what a lower
+    #    one added. So the operator's own `~/.claude/settings.json` `excludedCommands` (their
+    #    INTERACTIVE exemptions — a broad `docker *`) merges straight into the leaf, and a
+    #    seeded list can only ever be a FLOOR. The one way to bound it is to not load the lower
+    #    scope at all: the family's `settings_scope_argv` (claude: `--setting-sources
+    #    project`), applied by the callers. A family without that flag cannot be bounded, so the
+    #    exemption is REFUSED rather than granted unbounded — fail closed, and say why.
+    #
+    # …and a THIRD hole, which swallows the other two whole (#289). When `sandbox.enabled` is
+    # true but the sandbox's own dependencies are missing, Claude Code does NOT fail — it
+    # DISABLES the sandbox, warns, and runs every command unconfined ("Sandbox disabled:
+    # …dependencies are missing: socat not installed · Commands will run WITHOUT sandboxing").
+    # A bounded exemption on top of no sandbox at all is not bounded; it is nothing. So seed
+    # `failIfUnavailable` — "Exit with an error at startup if sandbox.enabled is true but the
+    # sandbox cannot start" (its schema) — and let the leaf REFUSE rather than run unconfined
+    # under a boundary this file, docs 05 and pdca.toml all claim it has. It fails loudly, and
+    # the tail lands in the bundle's `*.error.log` (#280/#286) instead of scrollback. `pdca
+    # doctor` catches the same gap BEFORE a run; this catches the operator who skipped it.
+    if cfg.leaf_unsandboxed_commands:
+        if profile.settings_scope_argv:
+            # `enabled` FIRST — without it none of the rest means anything, and this seed was
+            # worse than useless (PR #290 review). `sandbox.enabled` defaults to FALSE
+            # (`sandbox?.enabled ?? false`), and `failIfUnavailable` is gated on it
+            # (`enabled && … && failIfUnavailable`). Worse: `--setting-sources project` drops
+            # the user/local scope, which is exactly where an operator's `sandbox.enabled: true`
+            # lives — so BOUNDING the exemption was REMOVING the sandbox it claims to bound. The
+            # leaf ran fully unconfined and the fail-closed guard never fired. Verified: with
+            # these keys but no `enabled`, a leaf starts silently on a socat-less host; with it,
+            # it refuses — "sandbox required but unavailable … refusing to start without a
+            # working sandbox".
+            granted["enabled"] = True
+            granted["excludedCommands"] = list(cfg.leaf_unsandboxed_commands)
+            granted["allowUnsandboxedCommands"] = False
+            granted["failIfUnavailable"] = True
+        else:
+            # The posture line must describe the posture the leaf ACTUALLY gets. With
+            # `network_access` also set, this same run appends the network grant a few lines
+            # later — so "the leaf stays fully sandboxed" was a lie whenever BOTH keys were
+            # configured, and a warning that misstates the active security posture is worse than
+            # no warning at all (PR #292 review, local pass).
+            if cfg.leaf_network_access and profile.network_argv:
+                posture = ("The leaf keeps its FILESYSTEM confinement — but `network_access = "
+                           "true` is set, so its socket/network layer IS open, for every command "
+                           "it runs and not just the named ones.")
+            elif profile.network_argv:
+                posture = ("The leaf stays fully sandboxed. For codex, use `[leaves.sandbox] "
+                           "network_access = true` instead: its sandbox has no per-command "
+                           "escape, and its docker-socket denial is the network layer, not the "
+                           "filesystem (#291).")
+            else:
+                posture = "The leaf stays fully sandboxed."
+            print("leaves: [leaves.sandbox] unsandboxed_commands is set, but the "
+                  f"'{profile.name}' family cannot be confined to the harness's own settings, "
+                  f"so a per-command exemption cannot be bounded — NOT granted. {posture}",
+                  file=sys.stderr)
+
+    if not granted:
+        return True   # nothing promised, nothing to seed
+    try:
+        dest = sandbox / ".claude"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "settings.json").write_text(
+            json.dumps({"sandbox": granted}, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # FAIL CLOSED (PR #290 review). This used to warn "the leaf runs under the ambient
+        # sandbox policy" and carry on — the exact OPPOSITE of what happened. The caller still
+        # passed `--setting-sources project`, so the leaf loaded ONLY project scope … which is
+        # this file, which does not exist. No `sandbox.enabled` (it defaults FALSE), and the
+        # operator's own user-scope sandbox dropped along with it: the leaf ran COMPLETELY
+        # unconfined, under a message asserting it was protected.
+        #
+        # False makes the caller WITHHOLD `--setting-sources`, so the leaf keeps the operator's
+        # ambient sandbox. The exemption then simply does not happen and a Docker-backed leg
+        # defers to a human, exactly as when none is configured. Degrade the FEATURE, never the
+        # BOUNDARY.
+        print(f"leaves: could not seed sandbox settings into {sandbox} ({exc}); the exemption "
+              "did NOT take effect — the leaf keeps the operator's ambient sandbox and a "
+              "Docker-backed leg will defer to a human", file=sys.stderr)
+        return False
+    return True
+
+
+def _seed_plan_sandbox_settings(sandbox: Path, profile: families.FamilyProfile, *,
+                                read_only: tuple[Path, ...] = ()) -> bool:
+    """A MINIMAL fail-closed sandbox policy for the plan reviewer (#301 review round 8).
+
+    Withholding :func:`_seed_sandbox_settings` from plan reviews (round 6 — the Check
+    opt-ins must not extend to them) left the temp cwd with NO settings file at all,
+    and claude's ``sandbox.enabled`` defaults to FALSE — so a Bash-capable
+    plan-reviewer agent ran with no sandbox and the claimed "brief/notes/sources +
+    pinned target" boundary was prose, not policy. Seed the sandbox ON with NONE of
+    the Check grants: no ``excludedCommands``, no network keys —
+    ``allowUnsandboxedCommands: false`` (the retry escape hatch stays ignored) and
+    ``failIfUnavailable: true`` (a socat-less host REFUSES rather than running
+    unconfined under a claimed boundary, #289/#290).
+
+    Returns whether the seed landed, so the caller passes the confinement flag
+    (``--setting-sources project`` — dropping the operator's user scope, whose own
+    ``excludedCommands`` would otherwise union in monotonically, #288) exactly iff
+    the seeded file exists; on a failed write the flag is withheld and the leaf
+    keeps the operator's ambient sandbox (degrade the feature, never the boundary).
+    Families without a settings mechanism (codex: its default workspace-write
+    sandbox is its own, argv-configured) need no seed: False.
+
+    ``read_only`` (issue #526) names directories the leaf may read but must never
+    write: the pinned target it grounds on and the bundle it reviews. Each becomes an
+    ``Edit`` deny rule, which Claude Code applies to every file-editing tool. The
+    plan-reviewer agent carries ``Write`` as the way to deliver its review when this
+    very sandbox cannot start and Bash is dead — and ``acceptEdits`` approves a write
+    anywhere in the leaf's working directories, the ``--add-dir`` target included
+    (observed: without these rules Write overwrote a file in the pinned target). A deny
+    rule only takes away; the three keys above are unchanged. Both the given and the
+    resolved spelling are denied, so a symlinked temp dir cannot slip past."""
+    if not profile.settings_scope_argv:
+        return False
+    policy: dict = {"sandbox": {"enabled": True,
+                                "allowUnsandboxedCommands": False,
+                                "failIfUnavailable": True}}
+    # `Edit(//abs/**)` is the absolute-path form of a Claude Code path rule.
+    deny = sorted({f"Edit(/{p}/**)" for d in read_only
+                   for p in (str(d.absolute()), str(d.resolve()))})
+    if deny:
+        policy["permissions"] = {"deny": deny}
+    try:
+        dest = sandbox / ".claude"
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "settings.json").write_text(json.dumps(policy, indent=2), encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"leaves: could not seed the plan-review sandbox into {sandbox} ({exc}); "
+              "the confinement flag is withheld — the leaf keeps the operator's ambient "
+              "sandbox", file=sys.stderr)
+        return False
+
+
+def _run_review_sandboxed(d: Path, cfg: Config) -> None:
+    """Run the reviewer in a temp dir holding ONLY the reviewer inputs.
+
+    This makes the independence contract mechanical, not prompt-based: with the
+    reviewer's cwd containing no build-notes.md, the builder's framing cannot
+    leak in even though the model has a Read tool. check-review.md is copied back.
+    """
+    with tempfile.TemporaryDirectory(prefix="pdca-review-") as tmp:
+        sandbox = Path(tmp)
+        for name in REVIEWER_INPUTS:
+            src = d / name
+            if src.exists():
+                shutil.copy2(src, sandbox / name)
+        # …and the round's frozen gate evidence, which check-gates.json rows reference by
+        # a bundle-relative `gate-logs/<rule_id>.log` path (#403): without it the leaf is
+        # asked to adjudicate rows whose whole basis is one `cd` away and unreachable.
+        _seed_sandbox_gate_logs(d, sandbox)
+        profile = cfg.profile(cfg.reviewer)
+        # Seed unconditionally: flag families need it to resolve `--agent` (#161);
+        # for inline families it is harmless (role prompts only, never build-notes).
+        _seed_sandbox_agents(cfg, sandbox)
+        # …and the project's sandbox policy, which is likewise invisible from a temp cwd
+        # (#261) — without it a loopback-socket runtime test can't bind, so it can never
+        # earn an automated red→green at Check.
+        seeded = _seed_sandbox_settings(cfg, sandbox, profile)
+        # Ground citations on the brief's target checkout (#75): name it via $PDCA_TARGET
+        # so the reviewer doesn't wander into unrelated checkouts. For a bundle WITH a
+        # patch, what is handed is a disposable git-self-contained copy INSIDE the
+        # sandbox (#419): the lane worktree's git index/objects live under the PRIMARY
+        # checkout's .git (worktree.py:14-16) — outside any granted dir and read-only to
+        # the leaf — so the contract's own pre-fix restore (`git stash`) could never run
+        # against it. The copy's .git is sandbox-local: stash/unstash work, and the
+        # primary checkout's git metadata sees no writes. Independence holds — the copy
+        # is materialized from the target source + patch.diff, never build-notes.md.
+        target = _reviewer_target(d, cfg)
+        repo = _reviewer_repo(d, target, sandbox) if target is not None else None
+        grounded = repo if repo is not None else target
+        env = {"PDCA_TARGET": str(grounded)} if grounded else None
+        # The grounding grant (claude: --add-dir) is only needed for a target OUTSIDE
+        # the sandbox cwd. When the sandbox-local copy is handed, granting the real
+        # checkout too would hand a read+write family (codex --add-dir,
+        # families.py:112-113) the shared lane worktree for no reviewer need.
+        extra_argv = ([profile.grounding_flag, str(target)]
+                      if repo is None and target and profile.grounding_flag else [])
+        # The confinement flag rides on `seeded` (a file that is not there must not cost
+        # the leaf its ambient sandbox, #290); the codex network grant does not (#291).
+        extra_argv += _sandbox_argv(cfg, profile, seeded=seeded)
+        error_log = d / state.REVIEW_ERROR_LOG
+        # A transient reviewer death (before emitting any work, or on its own report of a
+        # transient API error) is retried with backoff before it degrades to a §6
+        # placeholder; the failed attempts' stderr and stream report land in error_log.
+        # `_LeafHarvest` owns check-review.md across those attempts (#541): a file a dead
+        # attempt left in the sandbox is withdrawn into error_log as that attempt dies, so
+        # what lands in the bundle is the LIVE attempt's own work or nothing at all.
+        _LeafHarvest(
+            produced=sandbox / "check-review.md", dest=d / "check-review.md",
+            unavailable=lambda reason, failure: _review_unavailable(
+                d, reason, failure=failure, error_log=error_log),
+            failed_reason="reviewer leaf failed",
+            empty_reason="reviewer produced no check-review.md",
+        ).run(
+            # The closing instruction goes AFTER the project rubric (#541), so it is the
+            # last thing the reviewer reads, rubric or not.
+            cfg.reviewer, sandbox,
+            _REVIEW_PROMPT + rubric_mod.for_reviewer(d, cfg)
+            + _COMPLETION_INSTRUCTION.format(artifact="check-review.md"),
+            error_log=error_log,
+            label=f"Check review {d.name}",
+            status=lambda: progress.bundle_activity(sandbox, ("check-review.md",)),
+            stream_json=True,  # Tier 3 (no-op unless the reviewer family has a stream)
+            env=env, extra_argv=extra_argv, cfg=cfg,
+        )
+
+
+# How a reviewer / advisory leaf failed (#138, #278). The split that matters downstream is
+# INFRA (infrastructure stopped it before a review came back) vs SUBSTANTIVE (the leaf itself
+# yielded nothing usable) — but the infra shapes need different *actions* from the operator,
+# so keep them distinct.
+# transient: died of transient infra — before emitting any work, or on its own report of
+#   a transient API error — and retries did not recover it.
+# substantive: ran and failed any other way (a signal death and a spent usage limit
+#   included), no usable verdict.
+_FAIL_TRANSIENT = "transient"
+_FAIL_STARTUP = "startup"          # never ran at all — the command could not be launched
+_FAIL_SUBSTANTIVE = "substantive"
+# Launched, but the vendor sandbox the harness seeded it with could not start on this host
+# (#526), so nothing it tried ran. Never inferred from an exception alone, as the others
+# are: only the vendor's own evidence of the sandbox failing sets it
+# (:class:`_BashSandboxProbe`, :func:`_sandbox_refusal`), so an ordinary empty result
+# stays substantive.
+_FAIL_SANDBOX = "sandbox"
+# …and the one shape that is none of those (#541): the leaf RAN and exited 0, but a dead
+# attempt's file could not be taken off the artifact path, so nothing there can be
+# attributed to it. Only :class:`_LeafHarvest` can raise it. A distinct FAILURE CLASS, not a
+# distinct status token: it selects its own prose in :func:`_unavailable_classification` and
+# shares the default `human-empty` marker with the substantive shape, because what every
+# machine reader takes from a marker — is this a placeholder, and the §6 / §10 label for why
+# (#526) — is true of both: no usable verdict reached the bundle. The distinction that
+# matters here is one a human reads, so it lives in the prose.
+_FAIL_UNOWNED = "unowned"
+
+
+def _failure_class(exc: Exception | None) -> str:
+    """Classify a failed leaf invocation.
+
+    A :class:`LeafError` means the child actually ran: ``transient`` (it died of a rate
+    limit / 5xx / network blip before emitting any work, or on its own report of one after
+    working — :attr:`LeafError.transient`) or substantive (any other way it can fail, a
+    signal death or a spent usage limit included). But a **startup** failure never produces a
+    LeafError at all — the spawn raises ``FileNotFoundError`` before one exists, when the
+    configured binary is absent or not executable (the canonical ``[Errno 2] … 'codex'``).
+    Reading ``.transient`` off such an exception yields ``False``, so it was reported as "the
+    leaf ran but did not yield a usable verdict" — for a leaf that never started (PR #285
+    review). It is infra, and it is precisely the case #278 exists to distinguish; but a
+    *plain* re-run fails the same way, so it is not the same action as a transient blip."""
+    if isinstance(exc, LeafError):
+        return _FAIL_TRANSIENT if exc.transient else _FAIL_SUBSTANTIVE
+    if isinstance(exc, OSError):  # FileNotFoundError / PermissionError from the spawn
+        return _FAIL_STARTUP
+    return _FAIL_SUBSTANTIVE
+
+
+def _review_unavailable(d: Path, reason: str, *, failure: str = _FAIL_SUBSTANTIVE,
+                        error_log: Path | None = None) -> None:
+    """Write a placeholder review flagging the gap as a §6 NEEDS-HUMAN, so a failed or
+    interrupted reviewer leaves a re-runnable bundle — not a half-checked one that
+    crashes assemble. The bundle still reaches sign-off; accept is blocked (C6).
+
+    ``failure`` (see :func:`_failure_class`) classifies the placeholder (#138) so the human
+    can tell infra — a transient blip, or a leaf that never started — from a reviewer that
+    genuinely needs a human; when an ``error_log`` with the failed attempts' output exists,
+    the placeholder points at it."""
+    print(f"leaves: {d.name} — advisory review unavailable ({reason})", file=sys.stderr)
+    (d / "check-review.md").write_text(
+        "# Advisory review — NOT COMPLETED\n\n"
+        f"The reviewer did not produce a verdict table ({reason}).\n\n"
+        + _unavailable_classification(failure, error_log)
+        # Defined in `assemble`, which recognises this exact row as no verdict (#409).
+        + f"- NEEDS-HUMAN — {assemble.REVIEW_UNAVAILABLE_FINDING}\n",
+        encoding="utf-8",
+    )
+
+
+def _unavailable_classification(failure: str, error_log: Path | None) -> str:
+    """Shared classification block for a failed reviewer/advisory placeholder (#138):
+    name the failure class and point at the captured error log when present.
+
+    Leads with a machine-readable leaf-status marker (#278). Without it, an empty advisory
+    artifact is ambiguous — "the adversary ran and found nothing" reads exactly like "the
+    adversary never ran", so an infra failure (no Docker, missing binary) presents as a clean
+    adversarial pass and the operator has to hand-annotate "infra, not substance". `assemble`
+    reads the marker and labels the §6 row accordingly.
+
+    Every infra shape (transient, startup, sandbox) carries an infra marker — no review came
+    back either way — but their prose differs, because the operator's next action
+    does: a transient blip is safe to re-run as-is; a leaf that never started will fail the
+    same way until its command is fixed; a leaf whose seeded sandbox could not start (#526)
+    will fail the same way until the HOST can start it.
+
+    The un-owned shape (#541) is the one that gets prose WITHOUT a marker of its own. Its leaf
+    RAN and exited 0, so "leaf did not run" would be false of it; it takes the default
+    `human-empty` instead, which is true of it: no usable verdict reached the bundle. What a
+    token cannot carry (that a dead attempt's file could not be taken off the artifact path,
+    and that the remedy is to clear whatever blocked the withdrawal) is spelled out in the
+    prose below, where the human reads it.
+
+    The marker only ever says WHY an artifact is a placeholder. Whether it IS one is settled
+    by the completion trailer the leaf writes as its artifact's last line
+    (:func:`assemble.leaf_status`), which no placeholder here carries. So the status table
+    does not grow to tell real from placeholder, and it stays closed at the four in
+    ``assemble._LEAF_STATUS_LABEL``: the un-owned shape shares `human-empty` rather than
+    adding one."""
+    status = {
+        _FAIL_TRANSIENT: assemble.LEAF_STATUS_INFRA,
+        _FAIL_STARTUP: assemble.LEAF_STATUS_STARTUP,
+        _FAIL_SANDBOX: assemble.LEAF_STATUS_SANDBOX,
+    }.get(failure, assemble.LEAF_STATUS_HUMAN)
+    marker = f"<!-- pdca:leaf-status {status} -->\n\n"
+    if failure == _FAIL_TRANSIENT:
+        kind = ("**transient infra — safe to re-run.** The leaf exited non-zero either "
+                "before emitting any work or on its own report of a transient API error "
+                "(a lost connection, an overload or 5xx, a passing rate-limit rejection), "
+                "and retries did not recover it — so it hit a rate limit or a transient "
+                "API/network error rather than finishing its review of the diff; a sibling "
+                "advisory leaf of a different family may already have covered it.")
+    elif failure == _FAIL_STARTUP:
+        kind = ("**startup infra — the leaf never ran.** Its configured command could not be "
+                "launched at all (the binary is absent, or not executable), so nothing "
+                "reviewed the diff — this is NOT an empty verdict. A plain re-run will fail "
+                "the same way: fix the leaf's `argv` / PATH first (`pdca doctor` checks each "
+                "command leaf's CLI), then re-run.")
+    elif failure == _FAIL_SANDBOX:
+        kind = ("**sandbox infra — the vendor sandbox could not start on this host.** The "
+                "harness runs this leaf under a sandbox that must refuse rather than run "
+                "unconfined (`failIfUnavailable`); on this host that sandbox could not start, "
+                "so no command the leaf tried ever ran, and it delivered no review — this is "
+                "NOT a reviewed-and-found-nothing result. A plain re-run will fail the same "
+                "way: the HOST has to be able to start the sandbox (bubblewrap + socat "
+                "installed, and unprivileged user namespaces allowed — on Ubuntu, "
+                "`kernel.apparmor_restrict_unprivileged_userns=1` denies them), then re-run.")
+    elif failure == _FAIL_UNOWNED:
+        kind = ("**un-owned artifact — the leaf RAN and exited 0, but nothing could be filed "
+                "as its work.** A file an earlier, DEAD attempt had left at the artifact path "
+                "could not be withdrawn, and what is there is still that file — so filing it "
+                "would report a dead attempt's text as this leaf's verdict. (Had the live "
+                "attempt written over it, that would be ITS work and would have been filed.) "
+                "The dead attempt's own text is quoted in the error log; read it, clear "
+                "whatever blocked the withdrawal, then re-run the leaf.")
+    else:
+        kind = ("**substantive — needs a human.** The leaf ran but did not yield a usable "
+                "verdict; do not assume an infra blip.")
+    log_ref = ""
+    if error_log is not None and error_log.exists():
+        log_ref = f" See `{error_log.name}` in this bundle for the captured error."
+    return f"{marker}Failure class: {kind}{log_ref}\n\n"
+
+
+# Stub bases per 5/5/1 element — what a real reviewer would re-derive; the offline
+# stub asserts the same complete table shape every command-mode reviewer must emit.
+_STUB_BASIS = {
+    "C1": "brief.md present and parsed",
+    "C2": "stub: reproduction red pre-fix",
+    "C3": "patch.diff present — one logical fix",
+    "C4": "stub red→green confirmed",
+    "C5": "stub: fix addresses the cited root cause",
+    "T1": "bundle structure complete",
+    "T2": "no forbidden constructs",
+    "T3": "imports resolve in a clean env",
+    "T4": "commit-msg / branch-target / version conform",
+    "T5": "conformance judgment clear",
+    "V":  "is this the right thing at all? (always-human by design)",
+}
+
+
+def _stub_review(d: Path, cfg: Config) -> None:
+    # Emit the SAME complete 5/5/1 verdict table the command-mode reviewer must
+    # produce: every element a row, all PASS except the always-human validation cell
+    # (NEEDS-HUMAN by design — it becomes the §6 item the human clears).
+    rows = ["| Item | Verdict | Basis |", "|------|---------|-------|"]
+    for elem, label, _kind, _oracle in gates.canonical_elements():
+        verdict = "NEEDS-HUMAN" if elem == "V" else "PASS"
+        rows.append(f"| {label} | {verdict} | {_STUB_BASIS.get(elem, '')} |")
+    (d / "check-review.md").write_text(
+        "# Cross-vendor reviewer (advisory, artifact-only)\n\n"
+        f"Reviewer family: {cfg.reviewer.family or 'stub'}. "
+        "Inputs: patch.diff, brief.md, check-gates.json (build-notes.md withheld).\n\n"
+        "## Per-item verdicts (5 correctness · 5 conformance · 1 validation)\n"
+        + "\n".join(rows)
+        + "\n\nValidation fitness-to-purpose stays NEEDS-HUMAN by design — the human "
+        "decides at sign-off.\n"
+        # The stub closes its artifact exactly as a command-mode leaf is told to (#541):
+        # it really did finish, so the offline path must not be the one shape the harness
+        # cannot recognise as complete.
+        f"\n{assemble.LEAF_COMPLETE_TRAILER}\n",
+        encoding="utf-8",
+    )
+
+
+# ----------------------------------------------------------------------------
+# Optional advisory reviewer leaves (issue #64) — an OPEN, role-distinct set of extra
+# advisory reviewers (e.g. a correctness-bug + reuse/cleanup code-review lens), each a
+# reviewer-shaped leaf. Always advisory: they write check-advisory-<id>.md and their
+# NEEDS-HUMAN findings route into SUMMARY §6; they never gate. Conditioned per-bundle by
+# an optional ``when`` ({field, substring}) brief match — empty ⇒ always run.
+# ----------------------------------------------------------------------------
+def advisory_artifact(d: Path, leaf_id: str) -> Path:
+    """The artifact path an advisory leaf writes (parallel to check-review.md)."""
+    return d / f"check-advisory-{leaf_id}.md"
+
+
+def advisory_error_log(d: Path, leaf_id: str) -> Path:
+    """The captured-error tail an advisory leaf leaves per failed attempt (#138/#540) —
+    named beside :func:`advisory_artifact` so the writer and the CHECKED-resume
+    discriminator (#369, ``only_missing`` below) share one spelling. Whether one of these
+    means "ran and FAILED" is ``state.leaf_ran_and_failed``, never its existence."""
+    return d / f"check-advisory-{leaf_id}.error.log"
+
+
+def _advisory_leaf(spec: dict, table: str, leaf_id: str) -> LeafConfig:
+    """The :class:`LeafConfig` for one ARRAY-form advisory spec — ``[[leaves.advisory]]``
+    (#64) and ``[[leaves.plan_advisory]]`` (#301) alike.
+
+    One constructor for both, because these tables are built from raw spec dicts here
+    rather than by ``Config.leaf()``: a per-leaf key added there reaches only the NAMED
+    ``[leaves.*]`` tables and is silently dropped for the array-form ones. ``memory_max``
+    (#420) is the case in point — a documented per-leaf bound that did nothing for the
+    advisory leaves, which are exactly the ones a run fans out CONCURRENTLY and therefore
+    the hungriest pool to bound."""
+    return LeafConfig(
+        mode=spec.get("mode", "stub"), family=spec.get("family", ""),
+        argv=list(spec.get("argv", [])), agent=spec.get("agent", ""),
+        model=spec.get("model", ""), effort=spec.get("effort", ""),
+        memory_max=memory_max_value(spec.get("memory_max", ""),
+                                    f"[[leaves.{table}]] '{leaf_id}'.memory_max"),
+    )
+
+
+def _advisory_applies(spec: dict, d: Path) -> bool:
+    """True iff this advisory leaf should run for bundle ``d``. Its ``when`` ({field,
+    substring}) matches a brief field case-insensitively; absent ⇒ always run. Delegates to
+    the shared :func:`_when_matches` (issue #152) — one predicate for both the advisory leaf
+    and the builder variant, no second implementation."""
+    return _when_matches(spec.get("when"), d, default=True)
+
+
+def _advisory_prompt(spec: dict, leaf_id: str, rubric: str = "") -> str:
+    role = spec.get("role") or "review the patch for correctness bugs and reuse / " \
+        "simplification / efficiency cleanups"
+    return (
+        f"You are an ADVISORY code reviewer — lens: {role}. You have ONLY patch.diff, "
+        "brief.md, check-gates.json and the round's frozen gate evidence in gate-logs/ "
+        "here (build-notes.md is withheld) — a row's `log` key names its "
+        "gate-logs/<rule_id>.log, the gate's full output, which is how you adjudicate a "
+        "gate you cannot re-run (#403); ground every "
+        "cited path:line on the target source at $PDCA_TARGET, never other checkouts. "
+        f"Write check-advisory-{leaf_id}.md: a short list of findings, each a Markdown "
+        "bullet with a path:line. Every NEEDS-HUMAN bullet (each becomes a SUMMARY §6 "
+        "item) MUST carry exactly one tag. If the finding is an IMPLEMENTATION defect the "
+        "builder can fix by iterating — a logic bug, a missed case, a weak or incorrect "
+        "test, a conformance nit — write it '- NEEDS-HUMAN [impl] — ', so the driver can "
+        "route it straight back to Do without spending the human's attention (issue #264). "
+        "If it needs a human ARCHITECTURAL / scope / fitness-to-purpose decision, write it "
+        "'- NEEDS-HUMAN [human] — '. Decide which for every bullet; an untagged bullet is "
+        "read as [human]. You are ADVISORY — you "
+        "never gate; the human decides at sign-off. If you find nothing, say so explicitly."
+    ) + rubric + _COMPLETION_INSTRUCTION.format(   # last, after the rubric (#541)
+        artifact=f"check-advisory-{leaf_id}.md")
+
+
+def _resolved_builder_family(d: Path) -> str:
+    """The family of the builder that actually ran, read from the last ``loop-telemetry.json``
+    attempt (issue #200 — the entry :func:`_record_loop_attempt` wrote in Do). This is the
+    *resolved* fact, so it holds whichever way the backend was chosen — an explicit
+    ``Do model`` (#167), difficulty routing (#134) or escalation (#135). Best-effort: an
+    absent / garbled file ⇒ ``""`` (unknown), never a crash."""
+    path = d / "loop-telemetry.json"
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        attempts = data.get("attempts") if isinstance(data, dict) else None
+        if attempts:
+            return str(attempts[-1].get("family", "") or "")
+    except (ValueError, OSError, AttributeError, IndexError):
+        pass
+    return ""
+
+
+def _decorrelation_note(d: Path, msg: str) -> None:
+    """Record an advisory-selection lapse (issue #200) as a §6 item. Written as a
+    check-advisory-*.md so :func:`assemble.assemble_summary` folds its NEEDS-HUMAN line into
+    §6 like any advisory finding — a human sees that decorrelation didn't hold for the bundle."""
+    advisory_artifact(d, "decorrelation").write_text(
+        "# Advisory review — decorrelation\n\n- NEEDS-HUMAN — " + msg + "\n", encoding="utf-8")
+
+
+def _select_advisory(specs: list[dict], d: Path, cfg: Config) -> list[dict]:
+    """Apply the advisory-selection policy (issue #200) to the already-``when``-filtered
+    ``specs``. Default (``mode`` unset) returns them unchanged — every applicable leaf runs
+    (#64). Under ``mode = "vendor-complement"`` the list is a VENDOR POOL: return the single
+    leaf whose ``family`` differs from the builder that ran, so a Codex-built bundle gets a
+    Claude advisory and vice-versa, automatically. If no different-vendor leaf exists (or the
+    builder family is unknown) fall back to the first applicable leaf rather than skip review
+    — a same-vendor review still beats none — and record the lapse in §6."""
+    if cfg.advisory_selection.get("mode") != "vendor-complement":
+        return specs
+    advisory_artifact(d, "decorrelation").unlink(missing_ok=True)  # a prior attempt's note
+    if not specs:
+        return specs
+    builder_family = _resolved_builder_family(d)
+    if builder_family:
+        # A complement must declare a KNOWN family that differs — a leaf with a blank/absent
+        # `family` is an unknown vendor (possibly the builder's own), never a guaranteed
+        # complement, so it falls through to the same-vendor §6 note rather than masquerading
+        # as decorrelated (a #64 config never had to set `family`).
+        complement = next(
+            (s for s in specs
+             if (fam := s.get("family", "").strip().lower()) and fam != builder_family.lower()),
+            None)
+        if complement is not None:
+            return [complement]
+        reason = (f"the builder ran family '{builder_family}' and no configured advisory "
+                  "declares a different (non-empty) family")
+    else:
+        reason = "the builder family that ran is unknown (no loop-telemetry.json)"
+    chosen = specs[0]
+    _decorrelation_note(
+        d, f"advisory reviewer '{chosen.get('id') or 'advisory'}' could not be decorrelated "
+           f"from the builder — {reason}; it ran same-vendor. Confirm the review's "
+           "independence by hand, or add a different-`family` [[leaves.advisory]] entry.")
+    return [chosen]
+
+
+def run_advisory_leaves(d: Path, cfg: Config, *, only_missing: bool = False) -> None:
+    """Run each configured advisory reviewer that applies (issue #64), after the
+    advisory-selection policy narrows the list (issue #200). Each writes
+    check-advisory-<id>.md; failures degrade to a §6 NEEDS-HUMAN placeholder, never crash
+    the cycle (advisory, like the main reviewer).
+
+    ``only_missing`` (#369) is the CHECKED-resume mode: a leaf whose artifact exists, or
+    whose error log is SETTLED (``state.leaf_ran_and_failed``), is skipped — so a leaf the
+    interrupted BUILT beat never reached, or left mid-retry with an unfinished record
+    (#540), is run (a leaf that ran and spent its attempts left a settled error log +
+    placeholder, #138, and is not re-run). The selection policy is re-applied FIRST — under
+    ``vendor-complement`` (#200) only one of the pool runs, so an unselected leaf's
+    absent artifact is legitimate, never "missing"; filtering the pool by absence
+    before selecting would instead promote an excluded leaf. On an uninterrupted
+    bundle every selected leaf's artifact exists, so this mode is a no-op."""
+    applicable = [spec for spec in cfg.advisory_leaves if _advisory_applies(spec, d)]
+    for spec in _select_advisory(applicable, d, cfg):
+        leaf_id = spec.get("id") or "advisory"
+        if only_missing and (advisory_artifact(d, leaf_id).exists()
+                             or state.leaf_ran_and_failed(advisory_error_log(d, leaf_id))):
+            continue
+        leaf = _advisory_leaf(spec, "advisory", leaf_id)
+        if leaf.mode == "command":
+            _run_advisory_sandboxed(d, cfg, leaf, spec, leaf_id)
+        else:
+            _stub_advisory(d, spec, leaf_id)
+
+
+def _run_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict, leaf_id: str) -> None:
+    """Run one advisory leaf in a temp dir holding ONLY the reviewer inputs (the same
+    independence sandbox as the main reviewer), grounding on $PDCA_TARGET (#75)."""
+    with tempfile.TemporaryDirectory(prefix="pdca-advisory-") as tmp:
+        sandbox = Path(tmp)
+        for name in REVIEWER_INPUTS:
+            if (d / name).exists():
+                shutil.copy2(d / name, sandbox / name)
+        _seed_sandbox_gate_logs(d, sandbox)   # see _run_review_sandboxed (#403)
+        profile = cfg.profile(leaf)
+        # Seed unconditionally: flag families need it to resolve `--agent` (#161);
+        # for inline families it is harmless (role prompts only, never build-notes).
+        _seed_sandbox_agents(cfg, sandbox)
+        # …and the project's sandbox policy, which is likewise invisible from a temp cwd
+        # (#261) — without it a loopback-socket runtime test can't bind, so it can never
+        # earn an automated red→green at Check.
+        seeded = _seed_sandbox_settings(cfg, sandbox, profile)
+        # Same #419 shape as _run_review_sandboxed: a bundle with a patch gets a
+        # disposable git-self-contained copy inside the sandbox (the lane worktree's git
+        # metadata is read-only to the leaf, so stash/unstash could never run there);
+        # the grounding grant is withheld for the sandbox-local copy.
+        target = _reviewer_target(d, cfg)
+        repo = _reviewer_repo(d, target, sandbox) if target is not None else None
+        grounded = repo if repo is not None else target
+        env = {"PDCA_TARGET": str(grounded)} if grounded else None
+        extra = ([profile.grounding_flag, str(target)]
+                 if repo is None and target and profile.grounding_flag else [])
+        extra += _sandbox_argv(cfg, profile, seeded=seeded)   # see _run_review_sandboxed
+        out = sandbox / f"check-advisory-{leaf_id}.md"
+        error_log = advisory_error_log(d, leaf_id)
+        # The same artifact owner as the main reviewer (#541) — one implementation, so a
+        # dead attempt's residue cannot be filed as a live attempt's findings HERE either;
+        # every failure still degrades to the §6 placeholder (advisory never crashes the
+        # cycle), which is what `unavailable` writes.
+        _LeafHarvest(
+            produced=out, dest=advisory_artifact(d, leaf_id),
+            unavailable=lambda reason, failure: _advisory_unavailable(
+                d, leaf_id, reason, failure=failure, error_log=error_log),
+            empty_reason="produced no artifact",
+        ).run(
+            leaf, sandbox,
+            _advisory_prompt(spec, leaf_id, rubric_mod.for_reviewer(d, cfg)),
+            error_log=error_log,
+            label=f"Advisory {leaf_id} {d.name}",
+            status=lambda: progress.bundle_activity(sandbox, (out.name,)),
+            stream_json=True, env=env, extra_argv=extra, cfg=cfg)
+
+
+def _stub_advisory(d: Path, spec: dict, leaf_id: str) -> None:
+    role = spec.get("role") or "correctness bugs + reuse/simplification cleanups"
+    advisory_artifact(d, leaf_id).write_text(
+        f"# Advisory review — {leaf_id} (stub)\n\nLens: {role}.\n\n"
+        "- NEEDS-HUMAN — advisory code-review lens is a stub here; a real "
+        f"`{leaf_id}` leaf (family/argv in [[leaves.advisory]]) reviews the patch and "
+        "lists findings. The human adjudicates at sign-off.\n"
+        f"\n{assemble.LEAF_COMPLETE_TRAILER}\n",   # it finished (#541) — see `_stub_review`
+        encoding="utf-8")
+
+
+def _advisory_unavailable(d: Path, leaf_id: str, reason: str, *,
+                          failure: str = _FAIL_SUBSTANTIVE,
+                          error_log: Path | None = None) -> None:
+    print(f"leaves: {d.name} — advisory '{leaf_id}' unavailable ({reason})", file=sys.stderr)
+    advisory_artifact(d, leaf_id).write_text(
+        f"# Advisory review — {leaf_id} — NOT COMPLETED\n\n"
+        + _unavailable_classification(failure, error_log)
+        # Defined in `assemble`, which recognises this exact row as no verdict (#409).
+        + "- NEEDS-HUMAN — "
+        + assemble.ADVISORY_UNAVAILABLE_FINDING.format(leaf=leaf_id, reason=reason) + "\n",
+        encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------
+# Plan-beat advisory reviewers (issue #301) — antagonists of the BRIEF, mirroring the
+# Check advisory machinery (#64/#200) at Plan: right after the planner writes brief.md,
+# each configured [[leaves.plan_advisory]] leaf reviews the PLAN (brief + notes +
+# sources — no patch, no gates), writes plan-advisory-<id>.md, the planner gets ONE
+# bounded revision pass over the findings, and a per-bundle BENEFIT record
+# (plan-advisory-benefit.json: brief hash before/after, revised?, finding count) captures
+# whether the review changed anything — the raw signal Act needs to judge whether plan
+# reviews pay off. Opt-in; an empty list leaves the Plan beat untouched.
+# ----------------------------------------------------------------------------
+PLAN_ADVISORY_INPUTS = ["brief.md", "notes.json"]  # + the sources/ dir, copied whole
+PLAN_ADVISORY_BENEFIT = "plan-advisory-benefit.json"
+
+
+def plan_advisory_artifact(d: Path, leaf_id: str) -> Path:
+    """The artifact a plan-advisory leaf writes. A distinct prefix from
+    ``check-advisory-*`` — the Check-side globs (assemble §5, archive) must not
+    pick these up as patch reviews."""
+    return d / f"plan-advisory-{leaf_id}.md"
+
+
+def _plan_advisory_prompt(spec: dict, leaf_id: str) -> str:
+    role = spec.get("role") or ("refute the brief: wrong root cause, untestable success "
+                                "criterion, hidden scope")
+    return (
+        f"You are an ADVISORY plan reviewer — an antagonist of the BRIEF, lens: {role}. "
+        "You have ONLY brief.md, notes.json and the sources/ dir here (no patch exists "
+        "yet); ground every claim about the code on the target source at $PDCA_TARGET, "
+        "never other checkouts. Attack the plan, not the prose: does the stated defect "
+        "match the tracker thread in notes.json/sources (wrong root-cause framing?); is "
+        "the success criterion something a gate or reviewer can actually verify, or "
+        "vibes; is the scope one logical fix or a hidden second change; do the repo + "
+        "branch target and any `Depends on` ids resolve (if dependency-state.json is "
+        "present it lists each declared prerequisite bundle's existence and state — "
+        "judge the declarations against it); did the brief ignore a "
+        "load-bearing comment in the thread. "
+        f"Write plan-advisory-{leaf_id}.md: a short list of findings, each a Markdown "
+        "bullet prefixed '- NEEDS-HUMAN — ' with the evidence (a brief line, a thread "
+        "quote, a path:line). You are ADVISORY — you never gate, and you never edit "
+        "brief.md yourself. \"Could not fault the brief after a real attempt\" is an "
+        "acceptable strong answer — say so explicitly. "
+        # #526: the fallback, its trigger and the disclosure are all prompt TEXT — a
+        # condition the model cannot see cannot gate anything, and a healthy run must
+        # never be told to claim Bash was down.
+        "Write the file into your current directory; the Write tool works even when Bash "
+        "does not. If Bash does not work in this run — every command fails before it "
+        "starts, e.g. with an `apply-seccomp:` or `bwrap:` error, because the sandbox "
+        "cannot start on this host — do not stop: finish the review with Read, Grep and "
+        f"Glob, create plan-advisory-{leaf_id}.md with the Write tool, and make its first "
+        "line say that Bash was unavailable in this run. Do not add that line when Bash "
+        "works."
+        # #541: the closing instruction goes LAST, after everything else the prompt says.
+        + _COMPLETION_INSTRUCTION.format(artifact=f"plan-advisory-{leaf_id}.md")
+    )
+
+
+def _plan_decorrelation_note(d: Path, msg: str) -> None:
+    """The plan-side twin of :func:`_decorrelation_note` (#200/#301)."""
+    plan_advisory_artifact(d, "decorrelation").write_text(
+        "# Plan advisory — decorrelation\n\n- NEEDS-HUMAN — " + msg + "\n", encoding="utf-8")
+
+
+def _select_plan_advisory(specs: list[dict], d: Path, cfg: Config) -> list[dict]:
+    """The #200 selection policy anchored on the PLANNER family (issue #301).
+
+    Pre-Do there is no builder telemetry, and the brief is the planner's artifact —
+    "reviewer ≠ author" therefore keys on ``cfg.planner.family`` (static config, no
+    telemetry needed). Unknown/empty planner family or no different-vendor leaf ⇒
+    same-vendor fallback + a decorrelation note, mirroring the Check-side contract."""
+    if cfg.plan_advisory_selection.get("mode") != "vendor-complement":
+        return specs
+    plan_advisory_artifact(d, "decorrelation").unlink(missing_ok=True)
+    if not specs:
+        return specs
+    planner_family = (cfg.planner.family or "").strip().lower()
+    if planner_family:
+        complement = next(
+            (s for s in specs
+             if (fam := s.get("family", "").strip().lower()) and fam != planner_family),
+            None)
+        if complement is not None:
+            return [complement]
+        reason = (f"the planner runs family '{planner_family}' and no configured "
+                  "plan-advisory declares a different (non-empty) family")
+    else:
+        reason = "the planner's family is not declared in [leaves.planner]"
+    chosen = specs[0]
+    _plan_decorrelation_note(
+        d, f"plan reviewer '{chosen.get('id') or 'plan-advisory'}' could not be "
+           f"decorrelated from the planner — {reason}; it ran same-vendor. Confirm the "
+           "review's independence by hand, or add a different-`family` "
+           "[[leaves.plan_advisory]] entry.")
+    return [chosen]
+
+
+def _brief_sha(d: Path) -> str:
+    """sha256 of brief.md's bytes ("" if absent) — the before/after benefit signal."""
+    bp = d / "brief.md"
+    return hashlib.sha256(bp.read_bytes()).hexdigest() if bp.is_file() else ""
+
+
+def _plan_findings(d: Path) -> int:
+    """SUBSTANTIVE findings across this bundle's plan-advisory artifacts.
+
+    Excluded: the decorrelation note (a selection lapse, not a brief finding) and any
+    NOT-COMPLETED placeholder — its NEEDS-HUMAN line reports infrastructure, not the
+    brief (#301 review round 3): counting it triggered a planner revision (and
+    ``findings: 1`` telemetry) over a missing CLI or transient outage. Placeholders
+    carry the machine-readable leaf-status marker (#278), the same signal §6 uses;
+    they still fold into §6 for the human, they just never drive the revision pass."""
+    return sum(sum(1 for line in text.splitlines()
+                   if line.lstrip().startswith("- NEEDS-HUMAN"))
+               for _leaf, status, text in _plan_advisory_outcomes(d)
+               if not status)  # a placeholder, not a review
+
+
+def _plan_not_completed(d: Path) -> dict[str, str]:
+    """``{leaf id: leaf status}`` for each plan-advisory leaf of this bundle that did NOT
+    deliver a review — its artifact is a placeholder (#526).
+
+    ``findings: 0`` reads the same whether a leaf reviewed the brief and found nothing,
+    or never reviewed it at all: a placeholder's NEEDS-HUMAN line is excluded from the
+    count. This is what tells them apart, and the status says why — ``sandbox-empty``
+    is the environment, ``human-empty`` is the leaf."""
+    return {leaf: status for leaf, status, _text in _plan_advisory_outcomes(d) if status}
+
+
+def _plan_advisory_outcomes(d: Path):
+    """Each plan-advisory leaf's artifact in this bundle, as ``(leaf id, leaf status,
+    text)`` — the status is ``""`` for a delivered review (#278).
+
+    The one walk :func:`_plan_findings` and :func:`_plan_not_completed` share, so what
+    counts as a leaf's artifact (the decorrelation note is a selection lapse, not a leaf
+    outcome) and what counts as a placeholder cannot drift between the finding count
+    and the completion record."""
+    for p in sorted(d.glob("plan-advisory-*.md")):
+        if p.name == "plan-advisory-decorrelation.md":
+            continue
+        text = p.read_text(encoding="utf-8")
+        yield (p.name.removeprefix("plan-advisory-").removesuffix(".md"),
+               assemble.leaf_status(text), text)
+
+
+def _run_plan_advisory_leaves(d: Path, cfg: Config) -> list[str]:
+    """Run the applicable plan-advisory leaves for one briefed bundle; return the leaf
+    ids that ran. Artifacts only — the revision + benefit record are the caller's."""
+    applicable = [s for s in cfg.plan_advisory_leaves if _advisory_applies(s, d)]
+    ran: list[str] = []
+    for spec in _select_plan_advisory(applicable, d, cfg):
+        leaf_id = spec.get("id") or "plan-advisory"
+        leaf = _advisory_leaf(spec, "plan_advisory", leaf_id)
+        if leaf.mode == "command":
+            _run_plan_advisory_sandboxed(d, cfg, leaf, spec, leaf_id)
+        else:
+            _stub_plan_advisory(d, spec, leaf_id)
+        ran.append(leaf_id)
+    return ran
+
+
+def _dependency_manifest(d: Path, cfg: Config) -> dict:
+    """``{dep id: {declared, exists, state}}`` for the brief's declared prerequisites
+    (#301 review round 5). The review sandbox holds only the plan inputs and
+    ``$PDCA_TARGET`` is the target repository — without this, the reviewer cannot
+    judge the ``Depends on`` / ``Depends on (merged)`` / ``Stacks on`` declarations it
+    is explicitly told to validate. ``find_bundle`` resolves archived copies too."""
+    bp = d / "brief.md"
+    out: dict[str, dict] = {}
+    for kind, ids in (("Depends on", brief.depends_on(bp)),
+                      ("Depends on (merged)", brief.depends_on_merged(bp)),
+                      ("Stacks on", brief.stacks_on(bp))):
+        for dep in ids:
+            b = cfg.find_bundle(dep)
+            out[dep] = {"declared": kind, "exists": b.is_dir(),
+                        "state": state.state(b) if b.is_dir() else None}
+    return out
+
+
+@contextlib.contextmanager
+def _plan_fallback_target(d: Path, cfg: Config):
+    """A DISPOSABLE grounding checkout when the brief's exact base cannot be
+    materialized (#301 review rounds 7/8): a temp DETACHED worktree at the resolved
+    primary's HEAD, removed after the review.
+
+    Never the lane worktree :func:`_reviewer_target` prefers (round 7) — pre-Do it
+    holds whatever its LAST user left there (another bundle's patch, or this
+    bundle's prior attempt after an iterate-to-Plan), and the antagonist would
+    fault the new brief against the wrong source. And never the primary checkout
+    itself (round 8): the family grounding flag is read/WRITE for codex
+    (``--add-dir``), so exposing the operator's working tree would let a reviewer
+    command mutate their uncommitted work despite the read-only contract. HEAD may
+    lag the brief's intended base — a loosely-grounded review still beats none
+    (advisory, never a gate). Unresolvable/non-git target or a failed add ⇒ ``None``
+    (the review grounds on the plan inputs alone)."""
+    from . import publish  # lazy: publish imports leaves, avoid an import cycle
+    try:
+        repo_spec, _base, _slug = publish._resolve_target(d)
+        primary = publish._checkout_path(cfg, repo_spec) if repo_spec else None
+    except Exception:  # noqa: BLE001 — grounding is best-effort, never fatal
+        primary = None
+    if primary is None or not (primary / ".git").exists():
+        yield None
+        return
+    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-")
+    pinned = Path(tmp) / "target"
+    if worktree._git(primary, "worktree", "add", "--detach", str(pinned), "HEAD") != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        yield None
+        return
+    try:
+        yield pinned
+    finally:
+        if worktree._git(primary, "worktree", "remove", "--force", str(pinned)) != 0:
+            shutil.rmtree(pinned, ignore_errors=True)
+            worktree._git(primary, "worktree", "prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _pinned_plan_target(d: Path, cfg: Config):
+    """A read-only checkout PINNED to the brief's resolved base ref, for grounding the
+    plan review (#301 review round 2).
+
+    Pre-Do there is no per-cycle worktree the review may trust, so this materializes
+    a temp DETACHED worktree at the exact ``base_ref`` the brief resolves to (the
+    drift.py pattern), removed after the review. Unresolvable target / failed add ⇒
+    :func:`_plan_fallback_target` — a disposable detached tree at the primary's
+    HEAD, deliberately neither :func:`_reviewer_target`'s lane worktree (another
+    bundle's patched content, round 7) nor the writable primary checkout itself
+    (round 8). A loosely-grounded review still beats none — advisory, never a
+    gate."""
+    tgt = worktree._target(d, cfg)
+    if tgt is None:
+        with _plan_fallback_target(d, cfg) as fb:
+            yield fb
+        return
+    primary, base_ref = tgt
+    worktree._git(primary, "fetch", cfg.base_remote)  # best-effort refresh of the base
+    if base_ref.startswith("origin/") and cfg.base_remote != "origin":
+        # A stacked base lives on origin (#123): with base_remote = "upstream", fetching
+        # only it leaves origin/<parent-branch> stale/absent, the worktree add fails and
+        # the review silently grounds on the sibling checkout instead of the stacked
+        # base (#301 review round 4). Mirror worktree.ensure's dual fetch.
+        worktree._git(primary, "fetch", "origin")
+    tmp = tempfile.mkdtemp(prefix="pdca-plan-target-")
+    pinned = Path(tmp) / "target"
+    if worktree._git(primary, "worktree", "add", "--detach", str(pinned), base_ref) != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        with _plan_fallback_target(d, cfg) as fb:
+            yield fb
+        return
+    try:
+        yield pinned
+    finally:
+        if worktree._git(primary, "worktree", "remove", "--force", str(pinned)) != 0:
+            shutil.rmtree(pinned, ignore_errors=True)
+            worktree._git(primary, "worktree", "prune")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# The vendor sandbox's OWN startup errors (issue #526), keyed on the prefix its helper
+# programs print — never on what the leaf says about them. Observed (claude-code 2.1.277,
+# a host with `kernel.apparmor_restrict_unprivileged_userns = 1`): the CLI exits 0 and
+# every Bash tool_result reads `Exit code 1\napply-seccomp: write /proc/self/setgroups
+# (nested userns is capability-restricted; caller must provide CAP_SYS_ADMIN): Permission
+# denied` — the command itself never started. `apply-seccomp:` is the sandbox's
+# seccomp/userns helper (the binary carries `apply-seccomp: write /proc/self/uid_map`,
+# `…: unshare(CLONE_NEWUSER)`, `…: prctl(PR_SET_SECCOMP)` and kin); `bwrap:` is
+# bubblewrap's own prefix for the same failure one layer out. Anchored at a line start, so
+# a command that merely PRINTS one of these words (a grep hit, a cat of this very file)
+# is not the sandbox failing. (template/tests/fixtures/README.md pins the observed bytes.)
+_SANDBOX_HELPER_ERROR_RE = re.compile(r"^(?:apply-seccomp|bwrap): .+$", re.MULTILINE)
+# The CLI's own refusal to start, the other face of `failIfUnavailable` (#526). Observed
+# (2.1.277, bubblewrap absent): exit 1, stderr `Error: sandbox required but unavailable:
+# sandbox is enabled but dependencies are missing: bubblewrap (bwrap) not installed · …`,
+# and a `result` event whose `errors` say `Sandbox required but unavailable: …`. `Sandbox
+# Error:` is its message when the sandbox fails to initialise at startup (read out of the
+# binary: `❌ Sandbox Error: ${…}` then exit 1 — not observed on a host).
+_SANDBOX_REFUSAL_RE = re.compile(
+    r"^.*(?:[Ss]andbox required but unavailable|Sandbox Error:).*$", re.MULTILINE)
+_EVIDENCE_MAX = 300  # one line of evidence in a placeholder, not a transcript
+
+
+def _evidence_line(text: str) -> str:
+    """One vendor error line, fit to quote inside a placeholder or a note: whitespace
+    flattened, bounded, and unable to pose as markup the harness reads back (a
+    ``<!--`` marker, a closing backtick)."""
+    flat = " ".join(text.split()).replace("`", "'").replace("<!--", "<! --")
+    return flat if len(flat) <= _EVIDENCE_MAX else flat[:_EVIDENCE_MAX] + " …"
+
+
+def _tool_result_text(content) -> str:
+    """The text of a claude ``tool_result`` block: a plain string, or text blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text") or "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+class _BashSandboxProbe:
+    """Watches a claude leaf's stream (the ``on_event`` hook of :func:`_invoke`) for one
+    fact (issue #526): did any Bash call the leaf made actually run, or did every one
+    fail inside the vendor sandbox's own startup?
+
+    On a host that denies what the sandbox needs, the CLI exits 0 and says nothing
+    anywhere a caller looks; the leaf's closing text is only its own paraphrase. The
+    tool results are the vendor's evidence, so they are what is read. Each result is
+    matched to its call by the ``tool_use`` id, so a Read or Grep result never counts
+    as a Bash one."""
+
+    def __init__(self) -> None:
+        self._bash_ids: set[str] = set()
+        self.ran = 0                 # Bash results that were NOT errors
+        self.errors: list[str] = []  # the text of every Bash result that was one
+
+    def __call__(self, ev: dict) -> None:
+        message = ev.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if (ev.get("type") == "assistant" and block.get("type") == "tool_use"
+                    and block.get("name") == "Bash" and isinstance(block.get("id"), str)):
+                self._bash_ids.add(block["id"])
+            elif (ev.get("type") == "user" and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") in self._bash_ids):
+                if block.get("is_error"):
+                    self.errors.append(_tool_result_text(block.get("content")))
+                else:
+                    self.ran += 1
+
+    def sandbox_start_failure(self) -> str:
+        """The vendor's startup error, iff the leaf made Bash calls and EVERY one failed
+        with it; else ``""``. One call that ran means the sandbox started; one failure
+        without the vendor's prefix means something else went wrong. Either way this is
+        not a sandbox that could not start, and the run keeps the class it has today."""
+        if self.ran or not self.errors:
+            return ""
+        hits = [_SANDBOX_HELPER_ERROR_RE.search(text) for text in self.errors]
+        return _evidence_line(hits[0].group(0)) if all(hits) else ""
+
+
+def _sandbox_refusal(output: str) -> str:
+    """The CLI's own "sandbox required but unavailable" line in a failed leaf's captured
+    output (its stderr tail, plus the stream report #506 retains), or ``""``."""
+    m = _SANDBOX_REFUSAL_RE.search(output or "")
+    return _evidence_line(m.group(0)) if m else ""
+
+
+def _run_plan_advisory_sandboxed(d: Path, cfg: Config, leaf: LeafConfig, spec: dict,
+                                 leaf_id: str) -> None:
+    """One plan-advisory leaf in a temp dir holding ONLY the plan inputs (the reviewer
+    independence sandbox, minus patch/gates), grounding on $PDCA_TARGET — a checkout
+    pinned to the brief's resolved base (#301 review round 2).
+
+    The outcome it files must be what happened to the leaf (#526). A vendor sandbox that
+    could not start on this host — the CLI refusing outright, or every Bash call dying
+    in the sandbox's own startup while the CLI exits 0 — is filed as ``sandbox-empty``
+    infra, on the vendor's own evidence, never as a substantive empty result. A review
+    the leaf still delivered without Bash is kept, with a note that Bash was down."""
+    with tempfile.TemporaryDirectory(prefix="pdca-plan-advisory-") as tmp, \
+            _pinned_plan_target(d, cfg) as target:
+        sandbox = Path(tmp)
+        for name in PLAN_ADVISORY_INPUTS:
+            if (d / name).exists():
+                shutil.copy2(d / name, sandbox / name)
+        if (d / "sources").is_dir():
+            shutil.copytree(d / "sources", sandbox / "sources")
+        manifest = _dependency_manifest(d, cfg)
+        if manifest:
+            (sandbox / "dependency-state.json").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        profile = cfg.profile(leaf)
+        _seed_sandbox_agents(cfg, sandbox)
+        # DELIBERATELY no _seed_sandbox_settings / _sandbox_argv here (#301 review
+        # round 6): those carry the CHECK-leaf sandbox grants ([leaves.sandbox]
+        # network_access / unsandboxed_commands / seeded network keys) an operator
+        # opted into for Docker-backed gates and the reviewer's prior-art fetch. A
+        # plan review needs none of that — it reads the brief, notes/sources and the
+        # pinned read-only target — so the leaf gets a MINIMAL fail-closed sandbox
+        # instead (#301 review round 8): _seed_plan_sandbox_settings turns the vendor
+        # sandbox ON with none of those grants (claude's sandbox.enabled defaults
+        # FALSE, so seeding nothing left a Bash-capable reviewer unconfined), and the
+        # confinement flag rides exactly iff the seed landed (#290). The pinned target
+        # and this bundle are read-only to the leaf's file tools (#526): Write is its
+        # way to deliver when Bash is dead, and must not become a way to edit either.
+        seeded = _seed_plan_sandbox_settings(
+            sandbox, profile, read_only=(d,) + ((target,) if target else ()))
+        env = {"PDCA_TARGET": str(target)} if target else None
+        extra = ([profile.grounding_flag, str(target)]
+                 if target and profile.grounding_flag else [])
+        if seeded:
+            extra += list(profile.settings_scope_argv)
+        out = sandbox / f"plan-advisory-{leaf_id}.md"
+        error_log = d / f"plan-advisory-{leaf_id}.error.log"
+        bash = _BashSandboxProbe()
+
+        def sandbox_account(err: Exception | None) -> tuple[str, str] | None:
+            """#526's reading of a run that filed nothing: a vendor sandbox that could not
+            start is ``sandbox-empty`` infra, on the vendor's own evidence — the CLI's
+            refusal (a failed run) or every Bash call dying in the sandbox's startup (a run
+            that exited 0 and wrote nothing). ``None`` keeps the generic account."""
+            if err is not None:
+                refusal = (_sandbox_refusal(getattr(err, "output", ""))
+                           if _failure_class(err) != _FAIL_STARTUP else "")
+                if refusal:  # the CLI refused to start without its sandbox
+                    return ("the vendor sandbox could not start, so the CLI refused to "
+                            f"run: {refusal}", _FAIL_SANDBOX)
+                return None
+            dead = bash.sandbox_start_failure()
+            if dead:
+                return ("produced no artifact; every Bash call it made failed before "
+                        f"running, because the vendor sandbox could not start: {dead}",
+                        _FAIL_SANDBOX)
+            return None
+
+        # The third site on the SAME artifact owner (#541): the plan reviewer's sandbox is
+        # no different, so a dead attempt's residue must not be filed as the brief's review
+        # here either. A fix that landed at the two Check sites and not at this one is
+        # exactly the shape this shared owner exists to make impossible. What is this
+        # site's own — #526's sandbox evidence — rides in as `explain`, not as a copy.
+        filed = _LeafHarvest(
+            produced=out, dest=plan_advisory_artifact(d, leaf_id),
+            unavailable=lambda reason, failure: _plan_advisory_unavailable(
+                d, leaf_id, reason, failure=failure, error_log=error_log),
+            empty_reason="produced no artifact", explain=sandbox_account,
+        ).run(
+            leaf, sandbox, _plan_advisory_prompt(spec, leaf_id),
+            error_log=error_log,
+            label=f"Plan advisory {leaf_id} {d.name}",
+            status=lambda: progress.bundle_activity(sandbox, (out.name,)),
+            stream_json=True, env=env, extra_argv=extra, cfg=cfg, on_event=bash)
+        dead = bash.sandbox_start_failure() if filed else ""
+        if dead:  # delivered without Bash (#526): say so, whatever the leaf said
+            _note_bash_unavailable(plan_advisory_artifact(d, leaf_id), dead)
+
+
+def _note_bash_unavailable(artifact: Path, evidence: str) -> None:
+    """Add the harness's own account to a review the leaf delivered while Bash was
+    dead (#526). The prompt asks the leaf to disclose it; this does not depend on the
+    leaf remembering to. A blockquote, not a bullet: it is not a finding, so it never
+    counts toward ``findings`` or triggers the revision pass.
+
+    A review the leaf CLOSED keeps its completion trailer as its last line (#541): the note
+    goes in just above it. Appended below, it would un-close the review, and a closed review
+    that quotes a leaf-status marker would then be read as a placeholder — the leaf's own
+    statement that it finished, undone by the harness's annotation."""
+    text = artifact.read_text(encoding="utf-8")
+    note = ("> **pdca:** Bash was unavailable to this reviewer. The vendor sandbox could "
+            "not start on this host, so every Bash call it made failed before running "
+            f"(`{evidence}`) and it ran no commands; this review was delivered without "
+            "Bash.\n")
+    above, _nl, closing = text.rstrip().rpartition("\n")
+    if closing.strip() == assemble.LEAF_COMPLETE_TRAILER:
+        text = f"{above.rstrip()}\n\n{note}\n{closing.strip()}\n"
+    else:
+        text += ("" if text.endswith("\n") else "\n") + "\n" + note
+    artifact.write_text(text, encoding="utf-8")
+
+
+def _stub_plan_advisory(d: Path, spec: dict, leaf_id: str) -> None:
+    role = spec.get("role") or "refute the brief (root cause, success criterion, scope)"
+    plan_advisory_artifact(d, leaf_id).write_text(
+        f"# Plan advisory — {leaf_id} (stub)\n\nLens: {role}.\n\n"
+        f"- NEEDS-HUMAN — plan-advisory lens is a stub here; a real `{leaf_id}` leaf "
+        "(family/argv in [[leaves.plan_advisory]]) reviews the brief and lists findings. "
+        "The human adjudicates at sign-off.\n"
+        f"\n{assemble.LEAF_COMPLETE_TRAILER}\n",   # it finished (#541) — see `_stub_review`
+        encoding="utf-8")
+
+
+def _plan_advisory_unavailable(d: Path, leaf_id: str, reason: str, *,
+                               failure: str = _FAIL_SUBSTANTIVE,
+                               error_log: Path | None = None) -> None:
+    print(f"leaves: {d.name} — plan advisory '{leaf_id}' unavailable ({reason})",
+          file=sys.stderr)
+    action = ("make the host able to start the sandbox, then re-run it"  # #526
+              if failure == _FAIL_SANDBOX else "re-run it")
+    plan_advisory_artifact(d, leaf_id).write_text(
+        f"# Plan advisory — {leaf_id} — NOT COMPLETED\n\n"
+        + _unavailable_classification(failure, error_log)
+        + f"- NEEDS-HUMAN — plan-advisory leaf '{leaf_id}' did not produce findings "
+        f"({reason}); {action} or adjudicate by hand.\n",
+        encoding="utf-8")
+
+
+def _plan_revision_prompt(cfg: Config, bundles: list[Path]) -> str:
+    per_bundle = "\n".join(
+        f"- {d}: findings in " + ", ".join(
+            p.name for p in sorted(d.glob("plan-advisory-*.md"))
+            if p.name != "plan-advisory-decorrelation.md")
+        for d in bundles)
+    return (
+        "You are the Plan leaf on a REVISION pass (issue #301) — do not re-plan from "
+        "scratch and do not implement. An antagonistic plan review raised findings "
+        "against the brief(s) below. For each bundle: read its plan-advisory-*.md, then "
+        "either revise brief.md in place to address a finding, or append a short "
+        "`Plan-review response:` line under the brief stating why the brief stands. "
+        "Keep the parsed `- **Label:** value` field shape. One pass, no new bundles.\n"
+        + per_bundle
+    )
+
+
+def _brief_snapshot(cfg: Config) -> dict[str, str]:
+    """Content-hash snapshot of every non-placeholder brief in the bundle root, keyed
+    by bundle name — the pre-session "before" picture `_fresh_plan_briefs` diffs
+    against (#301 review round 5's content-hash rule, shared by `do_plan` and
+    `do_plan_batch` so a single-bundle session's PLAN reach is snapshotted the same
+    way a batch session's is, #480). An unfilled template copy is NOT briefed (round
+    2 — the same placeholder semantics as `state.state()`, #113): the session
+    replaces it with a real brief that must get its plan review."""
+    return {d.name: _brief_sha(d) for d in cfg.bundle_root.glob("issue_*")
+            if (d / "brief.md").exists() and not brief.is_placeholder(d / "brief.md")}
+
+
+def _fresh_plan_briefs(cfg: Config, briefed_before: dict[str, str]) -> list[Path]:
+    """Every bundle in the root a Plan session authored or REWROTE a brief for, against
+    the pre-session `_brief_snapshot` (#301 review round 5's content-hash rule).
+
+    Shared by `do_plan` and `do_plan_batch` (#480) so a single-bundle session's
+    plan-advisory reach matches the batch session's: a `pdca split <id> --accept`
+    run INSIDE either session's planner call writes authored briefs into new child
+    bundles neither call was individually handed, and this re-scan over the whole
+    root (not just the bundle the caller started with) is what picks them up.
+    Terminal bundles (a split parent that reached `close-disposition`) and
+    placeholder briefs are excluded downstream, by `run_plan_advisory_batch`
+    itself — the one choke point both Plan paths funnel through — so a bundle
+    marked terminal by a split accepted mid-session is filtered there whether it
+    reached this list or not."""
+    return sorted(d for d in cfg.bundle_root.glob("issue_*")
+                  if (d / "brief.md").exists()
+                  and (d.name not in briefed_before
+                       or _brief_sha(d) != briefed_before[d.name]))
+
+
+def run_plan_advisory_batch(cfg: Config, bundles: list[Path]) -> None:
+    """The Plan-beat advisory pass over freshly briefed bundles (issue #301).
+
+    Per bundle: run the selected plan-advisory leaves (artifacts). Then, if any bundle
+    has findings, ONE planner revision invocation covers them all (bounded by
+    construction — never a loop), and each reviewed bundle gets its benefit record.
+    No-op when nothing is configured or nothing is reviewable (a placeholder brief is
+    a template, not a plan — reviewing it would grade boilerplate). A bundle carrying
+    `close-disposition` (terminal — split parent decomposed rather than built,
+    `split.py:862`) is excluded on BOTH Plan paths (#480): the parent's superseded
+    brief must never trigger the revision session over a bundle nothing will build."""
+    if not cfg.plan_advisory_leaves:
+        return
+    reviewed = [d for d in bundles
+                if (d / "brief.md").exists() and not brief.is_placeholder(d / "brief.md")
+                and not (d / state.CLOSE_MARKER).exists()]
+    ran: dict[Path, list[str]] = {}
+    for d in reviewed:
+        # A rewritten brief (or a changed pool/`when` selection) must not inherit the
+        # PREVIOUS review's artifacts (#301 review round 6): stale findings would
+        # re-enter _plan_findings and §6 and could trigger a revision — or block
+        # sign-off — against a brief they never reviewed. Cleared BEFORE selection,
+        # so they vanish even when the new brief matches no leaf.
+        for stale in d.glob("plan-advisory-*"):
+            stale.unlink(missing_ok=True)
+        ids = _run_plan_advisory_leaves(d, cfg)
+        if ids:
+            ran[d] = ids
+    if not ran:
+        return
+    before = {d: _brief_sha(d) for d in ran}
+    with_findings = [d for d in ran if _plan_findings(d) > 0]
+    if with_findings and cfg.planner.mode == "command":
+        # Contained like the advisory leaves themselves (#301 review round 3): the
+        # revision is an OPT-IN advisory step, and a planner that exits non-zero here
+        # must not fail an otherwise completed Plan beat (or skip the benefit records
+        # below). The original briefs are untouched on failure → revised stays False.
+        try:
+            _invoke(cfg.planner, cfg.root, _plan_revision_prompt(cfg, with_findings), cfg=cfg,
+                    extra_argv=_bundle_grant(with_findings, cfg, cfg.profile(cfg.planner)))
+        except Exception as exc:  # noqa: BLE001 — advisory: never crash the Plan beat
+            print(f"leaves: plan-advisory revision pass failed ({type(exc).__name__}: "
+                  f"{exc}); briefs left as authored — findings stay open in §6",
+                  file=sys.stderr)
+    for d, ids in ran.items():
+        after = _brief_sha(d)
+        not_completed = _plan_not_completed(d)
+        (d / PLAN_ADVISORY_BENEFIT).write_text(json.dumps({
+            "before_sha": before[d],
+            "after_sha": after,
+            "revised": after != before[d],
+            "findings": _plan_findings(d),
+            # #526: without these, a leaf that never reviewed the brief records the same
+            # `findings: 0, revised: false` as one that reviewed it and found nothing —
+            # and a run of those would convict plan review at Act for an environment
+            # fault. `completed` is false iff some leaf left a placeholder; `not_completed`
+            # names each such leaf with its leaf status (why: `sandbox-empty` = the host).
+            "completed": not not_completed,
+            "not_completed": not_completed,
+            "leaves": ids,
+        }, indent=2) + "\n", encoding="utf-8")
+
+
+def run_plan_advisory(d: Path, cfg: Config) -> None:
+    """Single-bundle convenience over :func:`run_plan_advisory_batch`."""
+    run_plan_advisory_batch(cfg, [d])
+
+
+# ----------------------------------------------------------------------------
+# Leaf 3 — Check sign-off (signoff, interactive): Claude + human reach the OK.
+# ----------------------------------------------------------------------------
+def run_signoff(d: Path, cfg: Config) -> None:
+    if cfg.signoff.mode == "command":
+        # Exit contract (#331): when the session ends, handoff.session reports a missing
+        # or malformed decision token (or an iterate-*/discontinue with no rationale) to
+        # the human. Report only, never a block (#534).
+        with handoff.session(cfg, "signoff", [d]) as henv:
+            # This bundle's own target checkout, and only it (#494): §6 items routinely
+            # ask the human to check the patch against the source it was built on.
+            _invoke(cfg.signoff, cfg.root, _signoff_prompt(d), cfg=cfg, env=henv or None,
+                    extra_argv=_bundle_grant([d], cfg, cfg.profile(cfg.signoff)))
+        return
+    _stub_signoff(d, cfg)
+
+
+def _signoff_prompt(d: Path) -> str:
+    return (
+        f"You are the Check sign-off leaf. Review {d}/SUMMARY.md, {d}/patch.diff, "
+        f"{d}/check-gates.md and {d}/check-review.md together with the human. Help "
+        f"the human clear the §6 NEEDS-HUMAN items in {d}/SUMMARY.md (change "
+        f"`- [ ]` to `- [x]` only with their explicit OK). Then write the agreed "
+        f"decision as a single token — one of: {', '.join(sorted(VALID_DECISIONS))} — "
+        f"into {d}/{SIGNOFF_DECISION}. For an iterate, add the rationale (why rejected / "
+        f"what to change) on the lines below the token; for discontinue, the rationale (why "
+        f"discontinued / where the work goes instead). Do not edit §9 yourself; the "
+        "driver records it under a deterministic guard. When the decision is written, "
+        f"verify this leaf's exit contract with `/handoff {d.name}` — the rationale "
+        "lines are the carry-forward the driver folds into the next attempt's brief. "
+        "`/handoff` is your self-check; when the session ends, the driver reports a "
+        "missing or malformed decision to the human."
+    )
+
+
+def _stub_signoff(d: Path, cfg: Config) -> None:
+    # Simulate the human clearing §6 and accepting, so the offline flow completes.
+    summary = d / "SUMMARY.md"
+    if summary.exists():
+        text = summary.read_text(encoding="utf-8")
+        summary.write_text(text.replace("- [ ]", "- [x]"), encoding="utf-8")
+    (d / SIGNOFF_DECISION).write_text("accept\n", encoding="utf-8")
+
+
+def run_signoff_batch(cfg: Config, bundles: list[Path]) -> None:
+    """Batch sign-off: ONE interactive session walks several halted bundles.
+
+    Mirrors :func:`do_plan_batch` — command mode runs a single seeded session over
+    the whole (cheap-first) chunk, so the human signs off N bundles without N session
+    startups + re-orientations; stub mode loops the per-bundle stub. Each bundle's
+    decision is written as soon as it is decided, so a session that ends early keeps
+    the bundles already done. The flow chunks the queue so one session is bounded
+    (``flow.SIGNOFF_BATCH_SIZE``). The headless reviewer is deliberately NOT batched
+    (kept per-bundle/sandboxed for independence + drop-isolation)."""
+    if not bundles:
+        return
+    if cfg.signoff.mode == "command":
+        # Exit contract (#331): every bundle of the batch is registered, so the report
+        # at session end names each bundle still without a valid decision (#534).
+        with handoff.session(cfg, "signoff", list(bundles)) as henv:
+            # One session, several bundles: each bundle's own resolved checkout is
+            # admitted, exactly once (#494) — a batch may span repos.
+            _invoke(cfg.signoff, cfg.root, _signoff_batch_prompt(bundles), cfg=cfg,
+                    env=henv or None,
+                    extra_argv=_bundle_grant(list(bundles), cfg,
+                                             cfg.profile(cfg.signoff)))
+        return
+    for d in bundles:
+        _stub_signoff(d, cfg)
+
+
+def _signoff_batch_prompt(bundles: list[Path]) -> str:
+    listing = "\n".join(f"  - {d}" for d in bundles)
+    return (
+        "You are the Check sign-off leaf, in BATCH mode: this ONE session covers "
+        f"several bundles (cheap-first):\n{listing}\n"
+        "Work them in order. For EACH bundle, review its SUMMARY.md / patch.diff / "
+        "check-gates.md / check-review.md with the human, help clear that bundle's §6 "
+        "NEEDS-HUMAN items (`- [ ]` → `- [x]` only with their explicit OK), then write "
+        f"the agreed decision token — one of: {', '.join(sorted(VALID_DECISIONS))} — into "
+        f"THAT bundle's {SIGNOFF_DECISION} file **as soon as it is decided** (so if the "
+        "session ends early the finished bundles keep their decisions). Every write names "
+        "its own `issue_<id>` bundle — never leave an item ambient to the batch or write "
+        "it into the wrong bundle. Do not edit §9 yourself; the driver records it under a "
+        "deterministic guard. After EACH bundle's decision is written, verify it with "
+        "`/handoff issue_<id>` (one bundle per invocation — ids are required). That is "
+        "your self-check; when the session ends, the driver reports every listed bundle "
+        "still without a valid decision to the human. To stop early on purpose, record "
+        "why with `python3 .claude/hooks/handoff_guard.py --abandon \"<why>\"`."
+    )
+
+
+def signoff_decision(d: Path) -> str:
+    """The decision token (first line of ``signoff-decision``), or "" if absent/invalid.
+
+    The file is ``<token>`` optionally followed by a free-text **rationale** on the
+    remaining lines (read by :func:`signoff_rationale`) — the human's "why iterate /
+    what to change" the driver carries forward into the brief on an iterate."""
+    p = d / SIGNOFF_DECISION
+    if not p.exists():
+        return ""
+    lines = p.read_text(encoding="utf-8").splitlines()
+    token = lines[0].strip() if lines else ""
+    return token if token in VALID_DECISIONS else ""
+
+
+def signoff_rationale(d: Path) -> str:
+    """The iterate rationale the sign-off leaf wrote below the token, or "" if none.
+
+    Lines after the first of ``signoff-decision`` — the actionable insight ("why this
+    Do attempt was rejected / what to change next") that the flow records into §9 and
+    the driver folds into the brief's carry-forward so the next iteration isn't blind."""
+    p = d / SIGNOFF_DECISION
+    if not p.exists():
+        return ""
+    return "\n".join(p.read_text(encoding="utf-8").splitlines()[1:]).strip()
+
+
+# ----------------------------------------------------------------------------
+# Leaf 4 — Act (act, interactive): review frozen cycles, suggest deltas if sensible.
+# ----------------------------------------------------------------------------
+def run_act(cfg: Config, date: str) -> None:
+    # Concurrent Act WRITERS serialize via the shared session lock (#299 review
+    # rounds 11/12): two flows completing at once both pass act_due before either
+    # advances the marker — and a manual `act log --append` takes the SAME lock —
+    # so the frontier union is never asked to undo duplicate act-log entries over
+    # one snapshot. The auto path WAITS for the active session (#299 review round
+    # 14) rather than skipping: a skip would leave this flow's newly frozen
+    # bundles without their promised automatic review until some unrelated later
+    # flow completed. The cadence re-check below then decides whether anything is
+    # left to review.
+    with act_mod.act_session(cfg, wait=True) as held:
+        if not held:  # only an unopenable lock file (never contention) lands here
+            print("leaves: cannot open the Act session lock — Act skipped this run; "
+                  "its cycles stay unreviewed for the next due Act", file=sys.stderr)
+            return
+        # Re-check the cadence UNDER the session lock: the other session may have
+        # just finished and advanced the frontier past our threshold — reviewing
+        # again would duplicate its entry over the same cycles.
+        if not act_mod.act_due(cfg):
+            print("leaves: Act no longer due — a concurrent session advanced the "
+                  "review frontier; skipped", file=sys.stderr)
+            return
+        # Snapshot the frozen set BEFORE the session (#299 review round 5): the
+        # review can only have covered what existed when it started — a bundle
+        # freezing mid-session must stay unreviewed, and re-globbing afterwards
+        # would push it past the frontier unseen. Fingerprints ride the SAME
+        # snapshot (#299 review round 17): a bundle recreated while the leaf runs
+        # must be attested by the hash the review read, not by post-session disk.
+        covered = act_mod.frozen_bundles(cfg)
+        snap_fps = {d.name: act_mod._fingerprint(d) for d in covered}
+        started = time.time()
+        if cfg.act.mode == "command":
+            # Exit contract (#331): the driver supplies the session-start act-log
+            # baseline (an end-of-session check structurally cannot take one), so
+            # /handoff can distinguish the entry THIS session wrote from a prior one.
+            with handoff.session(cfg, "act") as henv:
+                # Admit the checkouts the REVIEWED bundles name (#494) — the snapshot
+                # `covered`, the same set the prompt indexes and the frontier advances
+                # over, so Act reads no repo it was not handed.
+                _invoke(cfg.act, cfg.root, _act_prompt(cfg, date, bundles=covered),
+                        cfg=cfg, env=henv or None,
+                        extra_argv=_bundle_grant(covered, cfg, cfg.profile(cfg.act)))
+        else:
+            _stub_act(cfg, date, bundles=covered)
+
+        # Advance the review frontier (issues #109/#299) whenever the Act beat
+        # runs — even if a command-mode Act judged "no delta" and wrote no act-log
+        # entry, the review happened, over exactly the pre-session snapshot.
+        # delta_guard applies the mid-session delta protection INSIDE the marker's
+        # critical section (#299 review round 7 — a scan out here would race
+        # revalidate's unmark_reviewed); the stamp's `changed` verdict decides, so
+        # a confirming revalidation doesn't withhold.
+        act_mod.mark_reviewed(cfg, reviewed=covered, date=date, delta_guard=started,
+                              fingerprints=snap_fps)
+
+
+def _act_prompt(cfg: Config, date: str, bundles: list[Path] | None = None) -> str:
+    # `bundles` is run_act's pre-session snapshot (#299 review round 13): indexing
+    # here must describe EXACTLY the set the frontier will advance over — a bundle
+    # freezing between the snapshot and this call would otherwise be reviewed (and
+    # logged) now, left out of the frontier, and reviewed AGAIN next cadence.
+    entries = act_mod.index(cfg, bundles=bundles)
+    act_mod.register_signals(cfg, entries, date)  # track recurring signals (#149)
+    recs = act_mod.recurrences(cfg, entries)
+    index_md = act_mod.render_index(entries, act_mod.patterns(entries),
+                                    act_mod.load_ledger(cfg), recs)
+    return (
+        "You are the Act leaf — cross-cycle process review. Below is the read-only "
+        "index of frozen cycles and recurring signals. With the human, decide which "
+        "process deltas (spec template / ruleset / gates / agent skills) are sensible "
+        f"— suggest improvements ONLY if warranted. Append a dated entry for {date} to "
+        "process/act-log.md — when no delta is warranted, still append the dated entry "
+        "saying so (the exit contract requires the session to NAME the entry it wrote). "
+        f"Then verify with `/handoff {date}` — it checks the entry against the driver's "
+        "session-start baseline. Never re-decide a contribution's disposition."
+        "\n\n--- ACT INDEX ---\n" + index_md
+    )
+
+
+def _stub_act(cfg: Config, date: str, bundles: list[Path] | None = None) -> None:
+    # Same snapshot rule as _act_prompt (#299 review round 13).
+    entries = act_mod.index(cfg, bundles=bundles)
+    act_mod.register_signals(cfg, entries, date)  # track recurring signals (#149)
+    recs = act_mod.recurrences(cfg, entries)
+    text = act_mod.scaffold_entry(entries, act_mod.patterns(entries), date=date, recs=recs)
+    act_mod.append_entry(cfg, text)
+
+
+# ----------------------------------------------------------------------------
+# Leaf 5 — Publish (publisher, interactive): the closing STEP of Check.
+# Writes the two contribution artifacts (commit-msg.txt + pr-description.md, the
+# T4 gate's inputs); the deterministic `publish` module does the git/draft-PR.
+# ----------------------------------------------------------------------------
+def run_publish(d: Path, cfg: Config) -> None:
+    if cfg.publisher.mode == "command":
+        # A non-claude publisher has no PreToolUse STOP hook, so give it the same `gh` PATH
+        # shim the builder gets (guard.py) — else a codex/other publisher could `gh pr ready`
+        # / `merge` itself, which is the human's Check sign-off, not the model's (best-effort;
+        # a no-op for claude, whose native hook already enforces this).
+        profile = families.resolve(cfg.publisher.family, cfg.families)
+        env = None if profile.native_guard else guard.shim_env(cfg, None)
+        # Exit contract (#331), merged over the gh-shim env: when the session ends,
+        # handoff.session reports a missing or lint-failing contribution artifact
+        # (existence + the instance's deterministic lint) to the human (#534).
+        with handoff.session(cfg, "publisher", [d]) as henv:
+            merged = {**(env or {}), **henv}
+            # The publisher is told to read the target checkout, and the deterministic
+            # half of publish already runs git against that very tree
+            # (publish.py:439-448) — admit it (#494) instead of asking the human.
+            _invoke(cfg.publisher, cfg.root, _publish_prompt(d, cfg),
+                    env=merged or None, cfg=cfg,
+                    extra_argv=_bundle_grant([d], cfg, profile))
+        return
+    _stub_publish(d, cfg)
+
+
+def _publish_prompt(d: Path, cfg: Config) -> str:
+    issue_id = d.name.removeprefix("issue_")
+    target = brief.field(d / "brief.md", "repo + branch target", "target")
+    pr_tpl = cfg.templates_dir / "pr-description.md.tpl"
+    trailer = cfg.issue_trailer.format(id=issue_id) if cfg.issue_trailer else ""
+    trailer_line = (
+        f"The LAST line of commit-msg.txt is the issue trailer `{trailer}` (the T4 gate "
+        "enforces it), preceded by a blank line with NOTHING appended after it — do not "
+        "add a Co-Authored-By or any other trailer below it (a project may require the "
+        "trailer to stand alone as a blank-separated last line). If no tracker id is "
+        "assigned yet (the bundle id is not a real tracker number), OMIT the trailer "
+        "entirely rather than invent a placeholder — `pdca publish --no-issue` records "
+        "the contribution as id_pending for the human to fill the id in later. "
+        if trailer else ""
+    )
+    # Only build the tracker link for a REAL ticket id — the bare ticket NUMBER (Mantis/GitHub
+    # are numeric). A slug bundle (a fork issue, e.g. `820-build-toolchain-coverage`), a
+    # `--no-issue` / id_pending placeholder (e.g. `PEND`), or any non-numeric id has no real
+    # ticket, so `issue_url_pattern.format(id=…)` would yield a broken link — omit it then,
+    # mirroring the trailer's id_pending handling (#192/#196). A non-numeric tracker simply
+    # won't auto-link: the safe failure (no broken URL; the bare id still shows).
+    real_ticket = issue_id.isdigit()
+    issue_url = (cfg.issue_url_pattern.format(id=issue_id)
+                 if cfg.issue_url_pattern and real_ticket else "")
+    link_clause = (
+        f" Put a clickable tracker link on the Summary's `Reported in [#{issue_id}]"
+        f"({issue_url})` line so a reader can click through. Keep the closing `Fixes` "
+        "trailer a BARE `#<id>` (never a Markdown link) — GitHub auto-closes only on a "
+        "bare id after the keyword, so a linked trailer silently fails to close the issue."
+        if issue_url else ""
+    )
+    return (
+        "You are the Publish leaf — the closing work of Check. The fix for issue "
+        f"{issue_id} is ACCEPTED; with the human, write TWO contribution artifacts in "
+        f"{d}, following the project's contributor rules (docs/INTEGRATION.md §4). "
+        f"Target: {target}. Read {d}/brief.md + {d}/build-notes.md + {d}/patch.diff for "
+        "content; cite the target source with `git -C <checkout>` (never `cd <checkout> "
+        f"&& git`). Also read {d}/SUMMARY.md §10 ('Act candidates'): fold any 'PR "
+        "description must include …' (or commit-scoped) note into the artifact you write "
+        "before drafting; a 'tracker-comment must include …' item is NOT yours (you write "
+        "only commit-msg.txt + pr-description.md) — leave it (#177).\n"
+        f"1) {d}/commit-msg.txt — a summary ≤70 chars, then a blank line, then the body "
+        f"wrapped ≤80; reference any other commit by its FULL hash. {trailer_line}\n"
+        f"2) {d}/pr-description.md — the Summary MUST open with a `**User impact:**` line "
+        "stating the bug's USER-VISIBLE effect (what the user experiences) BEFORE Root "
+        "cause, then the one-line change + What to look at (for non-implementors), then "
+        f"Root cause / Fix, then a Verification claim→evidence trail citing path:lines on "
+        f"the target branch; no internal jargon (see {pr_tpl}).{link_clause}\n"
+        "Write ONLY those two files. Do NOT push, branch, or open a PR — the driver's "
+        "`pdca publish` does the branch/apply/commit/push/draft-PR after you finish. "
+        f"When both are written, verify with `/handoff {d.name}` — it checks both "
+        "artifacts against the instance's deterministic contribution lint. That is your "
+        "self-check; when the session ends, the driver reports anything still unmet to "
+        "the human."
+    )
+
+
+def _stub_publish(d: Path, cfg: Config) -> None:
+    # Offline placeholders, shaped to pass a contribution (T4) gate: summary ≤70,
+    # blank line, body ≤80, the configured issue trailer last; PR body has the
+    # sections that pr-description.md.tpl prescribes (accessible lead → internals →
+    # verification trail, #106).
+    issue_id = d.name.removeprefix("issue_")
+    trailer = cfg.issue_trailer.format(id=issue_id) if cfg.issue_trailer else ""
+    body = (
+        f"Fix issue {issue_id} (stub contribution artifact)\n\n"
+        "Stub commit body for the offline publish slice, wrapped under eighty\n"
+        "characters so a contribution gate validates it cleanly.\n"
+    )
+    if trailer:
+        body += f"\n{trailer}\n"
+    (d / "commit-msg.txt").write_text(body, encoding="utf-8")
+    # PR body mirrors pr-description.md.tpl: a `**User impact:**` opener BEFORE Root cause
+    # and the issue-trailer form last, so the offline path keeps passing the T4
+    # contribution gate (contribcheck).
+    pr_trailer = trailer if trailer else f"References #{issue_id}"
+    (d / "pr-description.md").write_text(
+        "## Summary\n**User impact:** stub user-visible effect.\n\nstub one-line change.\n\n"
+        "## What to look at\nstub.\n\n## Root cause\nstub.\n\n"
+        "## Fix\nstub.\n\n## Verification\n- Claim: stub.\n- Checked: path:1 — stub.\n"
+        "- Test: path:1 — stub regression test, fails pre-fix / passes post-fix.\n\n"
+        f"{pr_trailer}\n",
+        encoding="utf-8",
+    )
