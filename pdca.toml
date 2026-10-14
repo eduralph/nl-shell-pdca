@@ -391,7 +391,7 @@ issue_trailer = "Fixes #{id}"
 # DETERMINISTICALLY hyperlinks the ticket id in the PR body (a Markdown link on the id, not
 # a bare number) — it does not depend on the model complying. E.g. Mantis
 # "https://github.com/eduralph/nl-shell/issues/view.php?id={id}", GitHub "https://github.com/eduralph/nl-shell/issues/{id}". "" ⇒ no link (bare id).
-issue_url_pattern = ""
+issue_url_pattern = "https://github.com/eduralph/nl-shell/issues/{id}"
 # Optional default tracker export the Plan leaf reads the issue row from when `flow`
 # runs without --from-csv (it reads ONLY that issue's row, not a repo scan):
 # export_csv = "path/to/export.csv"
@@ -429,6 +429,14 @@ issue_url_pattern = ""
 # [[plan.source]]
 # type = "command"           # exactly today's notes_cmd, but one of several sources
 # cmd = "./engine/scripts/scrape-notes.sh {id}"
+
+# The tracker IS GitHub here, so `gh` is the canonical fetch: this source writes the
+# bundle's notes.json itself (role = "tracker") and the planner briefs from the full
+# issue thread with no scrape script.
+[[plan.source]]
+type = "github"
+role = "tracker"
+repo = "eduralph/nl-shell"
 
 # Publish mechanics — `nl-shell-pdca publish` and the flow's publish-on-accept (docs 03 §Check
 # closing step). Branch patterns are `{id}` / `{slug}` format strings; the
