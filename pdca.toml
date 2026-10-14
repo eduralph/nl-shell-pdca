@@ -573,7 +573,7 @@ argv = ["claude", "--agent", "splitter", "--permission-mode", "acceptEdits"]
 # Switch `mode` to "command" to enable — the argv below is ACTIVE so that one edit is
 # enough. `--allowedTools Read Write`: the leaf reads brief.md and must WRITE sizing.json,
 # and a Read-only grant would let it run and produce nothing.
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = false
 agent = "sizer"
@@ -727,13 +727,14 @@ argv = ["claude", "--remote-control", "--agent", "publisher", "--permission-mode
 # red→green evidence and the reviewer's verdict (defaults to "refuted" when uncertain),
 # gated to the highest blast-radius bundles via the Difficulty signal (#133). Advisory —
 # never gates; its `- NEEDS-HUMAN —` findings route into SUMMARY §6.
-# [[leaves.advisory]]
-# id = "adversary"
-# role = "refute the red→green evidence and the reviewer's verdict; find the input that breaks the fix"
-# mode = "stub"
-# family = "claude"
-# argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
-# when = { field = "difficulty", substring = "high" }
+# Live on every bundle (no `when`): a self-reported difficulty field must not route a patch
+# away from the review that would catch the mis-rating — the same reasoning as security-review.
+[[leaves.advisory]]
+id = "adversary"
+role = "refute the red→green evidence and the reviewer's verdict; find the input that breaks the fix"
+mode = "command"
+family = "claude"
+argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 
 # The SECURITY lens (after getwyrd/wyrd-pdca#274): reads the patch the way an attacker would —
 # who controls each input the diff touches, what they gain — and rates findings against
@@ -791,13 +792,12 @@ argv = ["claude", "-p", "--agent", "security-review", "--permission-mode", "acce
 # working directory, and the harness denies file edits on the pinned target and on the
 # bundle. Listing `Write` here would pre-approve it for EVERY path — observed: it then
 # overwrote a file outside all of the leaf's granted directories.
-# [[leaves.plan_advisory]]
-# id = "plan-reviewer"
-# role = "refute the brief: wrong root cause, untestable success criterion, hidden scope"
-# mode = "stub"
-# family = "claude"
-# argv = ["claude", "-p", "--agent", "plan-reviewer", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
-# when = { field = "difficulty", substring = "high" }
+[[leaves.plan_advisory]]
+id = "plan-reviewer"
+role = "refute the brief: wrong root cause, untestable success criterion, hidden scope"
+mode = "command"
+family = "claude"
+argv = ["claude", "-p", "--agent", "plan-reviewer", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 #
 # [leaves.plan_advisory_selection]
 # mode = "vendor-complement"   # anchor: the PLANNER family (the brief's author)
