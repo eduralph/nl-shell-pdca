@@ -975,6 +975,20 @@ hint = "make install — or point $PDCA_CLI at the CLI; ./scripts/pdca resolves 
 required = true
 
 [[doctor.checks]]
+group = "target"
+id = "reference VM (C7 slices: sudo, VM tests)"
+cmd = "virsh -c qemu:///session dominfo nl-shell-26.04 >/dev/null 2>&1 || virsh -c qemu:///system dominfo nl-shell-26.04 >/dev/null 2>&1"
+hint = "nl-shell M1.1 (#22) builds the VM 'nl-shell-26.04'; needed only for slices whose brief declares `reference-vm` (INTEGRATION §11, C7)"
+level = "WARN"
+
+[[doctor.checks]]
+group = "target"
+id = "GPU (C7 slices: gpu-16gb)"
+cmd = "nvidia-smi -L >/dev/null 2>&1 || vulkaninfo --summary >/dev/null 2>&1 || rocminfo >/dev/null 2>&1 || ls /dev/dri/renderD* >/dev/null 2>&1"
+hint = "needed only for slices whose brief declares `gpu-16gb` (INTEGRATION §11, C7); a GPU render node counts, `apt install vulkan-tools` gives a precise check"
+level = "WARN"
+
+[[doctor.checks]]
 group = "engine"
 id = "bash >= 4 (C4 gate uses mapfile)"
 cmd = "bash -c 'test \"${BASH_VERSINFO[0]}\" -ge 4'"
@@ -1140,6 +1154,9 @@ checks = [
   { id = "C4-verify", tier = "C4", label = "fix verified: bundle test red pre-fix, green post-fix (pytest)", cmd = "./engine/scripts/run-verify.sh", gating = true, scope = "bundle" },
   { id = "T3-suite", tier = "T3", label = "runtime: the whole nl-shell pytest suite on the patched worktree", cmd = "./engine/scripts/run-suite.sh", gating = true, scope = "bundle" },
   { id = "T4-contribution", tier = "T4", label = "PR body has a user-impact opener + tracker id in both artifacts", cmd = "./scripts/pdca contribcheck", gating = true, scope = "bundle" },
+  # Advisory (#11): a patch touching nl-shell's gate, PTY, sudo, taint, reader, logging or
+  # installer code (or their specs) without updating the threat model lands in SUMMARY §6.
+  { id = "T2-threat-model", tier = "T2", label = "security-relevant change also updates the threat model", cmd = "./engine/scripts/check-threat-model-touch.sh", gating = false, scope = "bundle" },
 ]
 
 
