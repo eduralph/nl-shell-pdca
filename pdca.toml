@@ -73,7 +73,7 @@ max_passes = 20
 # (the empirical size thresholds further down, whose `rounds` rule fires before this cap on
 # purpose) and `max_auto_iters` rounds per bundle (clamped below max_passes). On either the
 # bundle halts for you as before. `PDCA_AUTO_ITERATE=1` / `--auto-iterate` override.
-auto_iterate = false
+auto_iterate = true
 max_auto_iters = 3
 # Worktree isolation (issue #94). A cycle's Do/Check run in a dedicated git worktree off
 # the target's base, so the host's primary checkout is NEVER mutated in place. The harness
