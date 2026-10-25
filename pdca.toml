@@ -963,8 +963,8 @@ required = true
 [[doctor.checks]]
 group = "engine"
 id = "nl-shell runtime deps (.venv)"
-cmd = ".venv/bin/python3 -c 'import prompt_toolkit'"
-hint = "make install — re-run it whenever nl-shell's pyproject.toml gains a dependency"
+cmd = ".venv/bin/python3 engine/scripts/check-target-deps.py"
+hint = "make install — re-run it whenever nl-shell's pyproject.toml gains a dependency (checks every runtime + dev dependency listed there, with its version floor)"
 level = "WARN"
 
 [[doctor.checks]]
@@ -988,11 +988,96 @@ cmd = "nvidia-smi -L >/dev/null 2>&1 || vulkaninfo --summary >/dev/null 2>&1 || 
 hint = "needed only for slices whose brief declares `gpu-16gb` (INTEGRATION §11, C7); a GPU render node counts, `apt install vulkan-tools` gives a precise check"
 level = "WARN"
 
+# Unicode Character Database 16.0.0 — the generator for nl-shell's vendored Unicode tables
+# (nl-shell#144, scripts/gen_unicode_tables.py) reads it; the tests do not.
+[[doctor.checks]]
+group = "target"
+id = "unicode-data"
+cmd = "grep -q '16.0.0' /usr/share/unicode/DerivedCoreProperties.txt && test -f /usr/share/unicode/PropList.txt && test -f /usr/share/unicode/UnicodeData.txt && test -f /usr/share/unicode/ScriptExtensions.txt && test -f /usr/share/unicode/Scripts.txt"
+hint = "sudo apt install unicode-data (Ubuntu 26.04 ships UCD 16.0.0); needed only for slices whose brief declares `unicode-data`"
+level = "WARN"
+
 [[doctor.checks]]
 group = "engine"
 id = "bash >= 4 (C4 gate uses mapfile)"
 cmd = "bash -c 'test \"${BASH_VERSINFO[0]}\" -ge 4'"
 hint = "install a modern bash"
+level = "WARN"
+
+# Libraries a bundle ADDS to nl-shell's pyproject.toml. `make install` reads the sibling
+# checkout's main, so it cannot install a dependency that exists only in a bundle's patch;
+# install it into .venv directly before the bundle's Do runs (nl-shell#10, #16).
+[[doctor.checks]]
+group = "engine"
+id = "ptyprocess"
+cmd = ".venv/bin/python3 -c 'import ptyprocess'"
+hint = ".venv/bin/python3 -m pip install 'ptyprocess>=0.7' — nl-shell#10 (PTY session) adds it to pyproject.toml; make install picks it up once that merges"
+level = "WARN"
+
+[[doctor.checks]]
+group = "engine"
+id = "pyyaml"
+cmd = ".venv/bin/python3 -c 'import yaml'"
+hint = ".venv/bin/python3 -m pip install 'PyYAML>=6' — nl-shell#143 (prompts YAML) adds it to pyproject.toml; make install picks it up once that merges"
+level = "WARN"
+
+# The policy gate's parser (nl-shell#12, spec policy-gate/v1 §1.2): tree-sitter-bash,
+# pinned in nl-shell's pyproject.toml by the slice that adds it.
+[[doctor.checks]]
+group = "engine"
+id = "tree-sitter-bash"
+cmd = ".venv/bin/python3 -c 'import tree_sitter, tree_sitter_bash; tree_sitter.Language(tree_sitter_bash.language())'"
+hint = ".venv/bin/python3 -m pip install 'tree-sitter>=0.25' 'tree-sitter-bash>=0.25' — nl-shell#12 adds them to pyproject.toml; make install picks them up once that merges"
+level = "WARN"
+
+# Test-only oracle for the gate's differential parser test (spec policy-gate/v1,
+# Conformance; nl-shell#12). Never shipped.
+[[doctor.checks]]
+group = "engine"
+id = "shfmt"
+cmd = "shfmt --version"
+hint = "sudo apt install shfmt (3.12.0 in Ubuntu 26.04 universe) — nl-shell#12 differential parser test"
+level = "WARN"
+
+# Host kernel properties the PTY session tests rely on (nl-shell#101): the outside checks
+# read /proc for the session's own bash, and the session refuses to start healthy when
+# TIOCSTI keystroke injection is allowed.
+[[doctor.checks]]
+group = "target"
+id = "proc-syscall"
+cmd = "test -r /proc/self/syscall && test -d /proc/self/fd"
+hint = "Linux with /proc mounted is required for the nl-shell#101 session tests"
+level = "WARN"
+
+[[doctor.checks]]
+group = "target"
+id = "tiocsti-off"
+cmd = "test \"$(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null)\" = 0"
+hint = "sudo sysctl -w dev.tty.legacy_tiocsti=0 (kernel >= 6.2; Ubuntu 26.04 default) — nl-shell#101"
+level = "WARN"
+
+[[doctor.checks]]
+group = "target"
+id = "ptrace-scope"
+cmd = "test \"$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)\" -ge 1"
+hint = "sudo sysctl -w kernel.yama.ptrace_scope=1 (Ubuntu default) — nl-shell#101, #137"
+level = "WARN"
+
+[[doctor.checks]]
+group = "engine"
+id = "pyyaml"
+cmd = ".venv/bin/python3 -c 'import yaml'"
+hint = ".venv/bin/python3 -m pip install 'PyYAML>=6' — nl-shell#16 (prompts YAML) adds it to pyproject.toml; make install picks it up once that merges"
+level = "WARN"
+
+# The Unicode Character Database files the #16 character-safety slice generates its
+# vendored tables from (build only — the tests read the generated module, not these).
+# Must match Python's unicodedata version (16.0.0 on Python 3.14).
+[[doctor.checks]]
+group = "engine"
+id = "unicode-data"
+cmd = "test -f /usr/share/unicode/DerivedCoreProperties.txt && test -f /usr/share/unicode/PropList.txt && test -f /usr/share/unicode/Scripts.txt && test -f /usr/share/unicode/ScriptExtensions.txt"
+hint = "sudo apt install unicode-data (16.0.0 on Ubuntu 26.04, matching Python 3.14's unicodedata) — nl-shell#16 character-safety slice"
 level = "WARN"
 
 # Deterministic Check gates (docs 04). Each check runs a shell command; it PASSES
