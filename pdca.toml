@@ -382,7 +382,7 @@ cmd = 'PYTHONPATH=src "$PDCA_BUNDLE/../../.venv/bin/python3" -m nl_shell'
 
 [tracker]
 system = "github"
-url = "https://github.com/eduralph/nl-shell/issues"
+url = "https://github.com/getwyrd/nl-shell/issues"
 issue_id_example = "#123"
 # Trailer linking a commit/PR to the issue ({id} = the bug id). Trackers differ
 # (GitHub/Mantis "Fixes #{id}", Jira "Fixes PROJ-{id}"); "" enforces none. The
@@ -394,8 +394,8 @@ issue_trailer = "Fixes #{id}"
 # Optional issue-URL template ({id} = the bug id). Set it and `nl-shell-pdca publish`
 # DETERMINISTICALLY hyperlinks the ticket id in the PR body (a Markdown link on the id, not
 # a bare number) — it does not depend on the model complying. E.g. Mantis
-# "https://github.com/eduralph/nl-shell/issues/view.php?id={id}", GitHub "https://github.com/eduralph/nl-shell/issues/{id}". "" ⇒ no link (bare id).
-issue_url_pattern = "https://github.com/eduralph/nl-shell/issues/{id}"
+# "https://github.com/getwyrd/nl-shell/issues/view.php?id={id}", GitHub "https://github.com/getwyrd/nl-shell/issues/{id}". "" ⇒ no link (bare id).
+issue_url_pattern = "https://github.com/getwyrd/nl-shell/issues/{id}"
 # Optional default tracker export the Plan leaf reads the issue row from when `flow`
 # runs without --from-csv (it reads ONLY that issue's row, not a repo scan):
 # export_csv = "path/to/export.csv"
@@ -440,7 +440,7 @@ issue_url_pattern = "https://github.com/eduralph/nl-shell/issues/{id}"
 [[plan.source]]
 type = "github"
 role = "tracker"
-repo = "eduralph/nl-shell"
+repo = "getwyrd/nl-shell"
 
 # Publish mechanics — `nl-shell-pdca publish` and the flow's publish-on-accept (docs 03 §Check
 # closing step). Branch patterns are `{id}` / `{slug}` format strings; the
@@ -936,7 +936,7 @@ argv = ["claude", "-p", "--agent", "plan-reviewer", "--permission-mode", "accept
 group = "target"
 id = "sibling checkout ../nl-shell"
 cmd = "test -e ../nl-shell/.git"
-hint = "git clone https://github.com/eduralph/nl-shell.git ../nl-shell"
+hint = "git clone https://github.com/getwyrd/nl-shell.git ../nl-shell"
 required = true
 
 [[doctor.checks]]
