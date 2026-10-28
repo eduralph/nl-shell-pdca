@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-fix correctness gate (C4) for nl-shell-pdca — target: eduralph/nl-shell (pytest).
+# Per-fix correctness gate (C4) for nl-shell-pdca — target: getwyrd/nl-shell (pytest).
 #
 # Wired from pdca.toml as a bundle-scoped GATING check. The driver has already
 # reconstructed base + patch.diff in $PDCA_WORKTREE, so this script proves red→green by

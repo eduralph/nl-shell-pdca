@@ -6,7 +6,7 @@
 > It does **not** restate the cycle. Conflict rule: generic wins on cycle
 > *shape*; this integration wins on *instantiation*.
 >
-> The target project is [nl-shell](https://github.com/eduralph/nl-shell), a
+> The target project is [nl-shell](https://github.com/getwyrd/nl-shell), a
 > natural-language shell for Ubuntu 26.04 (Python, pytest). The target checkout is
 > the sibling `../nl-shell` (the `[publisher.checkouts]` sibling default); a required
 > doctor row verifies it exists. nl-shell's own design docs are the source of truth
@@ -15,7 +15,7 @@
 > Maintained by Act (append changes; don't silently rewrite).
 
 ## 1. Tracker integration
-- **System / URL:** github — https://github.com/eduralph/nl-shell/issues
+- **System / URL:** github — https://github.com/getwyrd/nl-shell/issues
 - **Issue-ID format:** `#123`
 - **Cross-link form (commit/PR → tracker):** `Fixes #{id}` trailer in the commit
   message and a closing keyword (`Closes #NNN`) in the PR body — the same reference
@@ -29,13 +29,13 @@
   issue with no milestone carries the `new` label and is backlog — the planner asks
   before taking one.
 - **Plan seeding:** `[[plan.source]] type = "github", role = "tracker",
-  repo = "eduralph/nl-shell"` — the planner reads the full issue thread via `gh`. It
+  repo = "getwyrd/nl-shell"` — the planner reads the full issue thread via `gh`. It
   should also read the milestone's tracker issue and the design docs the issue names
   (`docs/plan.md`, `docs/design/`).
 - **Comment voice / template:** `templates/tracker-comment.md.tpl`
 
 ## 2. Branch-target rules
-- **Per-area branch map:** everything → `main` of `eduralph/nl-shell` (single line;
+- **Per-area branch map:** everything → `main` of `getwyrd/nl-shell` (single line;
   releases are annotated `vX.Y.0` tags at ★ release points, no maintenance branches).
   Changes to **this instance itself** (pdca.toml, engine/, docs/) are ordinary
   nl-shell-pdca PRs to its own `main`, outside the cycle machinery.
@@ -135,18 +135,18 @@ against nl-shell's `.oss-scanner/threat_model.md` (`agents/security-review.md`).
   - model, dataset or dependency **license** questions (release-gating in nl-shell).
 
 ## 5. Upstream-isn't-ahead routine
-- **What "upstream" is:** `eduralph/nl-shell` `main` itself — own-repo model, no
+- **What "upstream" is:** `getwyrd/nl-shell` `main` itself — own-repo model, no
   fork, no divergence to reconcile. "Ahead" can only mean *already done on main or in
   flight on a branch/PR*.
 - **Search routine + tokenization gotchas:** by affected file path first:
   `git -C ../nl-shell log --oneline origin/main -- <path>`; then
-  `gh search issues --repo eduralph/nl-shell "<keywords>"` (GitHub tokenizes on word
+  `gh search issues --repo getwyrd/nl-shell "<keywords>"` (GitHub tokenizes on word
   boundaries — search bare terms like `passthrough`, not `PTY passthrough mode`), and
-  scan the issue's milestone and open PRs (`gh pr list -R eduralph/nl-shell`).
+  scan the issue's milestone and open PRs (`gh pr list -R getwyrd/nl-shell`).
 - **Merged-history check command:**
   `git -C ../nl-shell fetch origin && git -C ../nl-shell log --oneline origin/main -n 30 -- <affected paths>`
 - **Closed/rejected-work check command:**
-  `gh pr list -R eduralph/nl-shell --state closed --limit 1000 --json number,title,mergedAt,files -q '.[] | select(.mergedAt == null) | select(any(.files[]; .path | IN("<path>", "<path>"))) | "\(.number) \(.title)"'`
+  `gh pr list -R getwyrd/nl-shell --state closed --limit 1000 --json number,title,mergedAt,files -q '.[] | select(.mergedAt == null) | select(any(.files[]; .path | IN("<path>", "<path>"))) | "\(.number) \(.title)"'`
   Record its output (or "none") in the brief's Prior-art line.
 
 ## 6. Brief and design-proposal templates

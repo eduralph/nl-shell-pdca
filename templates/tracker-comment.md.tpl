@@ -1,5 +1,5 @@
 
-# Tracker comment — github (https://github.com/eduralph/nl-shell/issues)
+# Tracker comment — github (https://github.com/getwyrd/nl-shell/issues)
 
 > Voice/format for nl-shell-pdca. Issue IDs look like `#123`.
 > One comment per disposition; cite the fix/PR and the evidence.

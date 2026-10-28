@@ -23,5 +23,5 @@ reviewer_family: codex
 ship_ci_workflow: true
 ship_merge_guard: true
 tracker_system: github
-tracker_url: https://github.com/eduralph/nl-shell/issues
+tracker_url: https://github.com/getwyrd/nl-shell/issues
 
